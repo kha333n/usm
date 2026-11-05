@@ -1,0 +1,57 @@
+name: 🧪 Test report
+description: USM on your machine - works or not, both help a lot
+title: "[Test report] "
+labels: ["test-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Reports from other machines, GPUs and distributions are the most useful help right now.
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Works well
+        - Works, with problems (see below)
+        - Does not work
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      placeholder: "Lenovo LOQ 15IRX9 laptop, 16 GB RAM"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: "RTX 3050 6 GB Laptop, NVIDIA 615.71 (open kernel modules)"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution, kernel, desktop
+      placeholder: "Ubuntu 26.04, kernel 7.0, GNOME 50"
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `usm check`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: bench
+    attributes:
+      label: Benchmark (optional)
+      description: "Table from `sudo tests/bench/usm-bench.sh` (with vs without USM, ~10 min, best right after a boot)."
+  - type: textarea
+    id: experience
+    attributes:
+      label: How it went
+      description: What you ran, how it felt with USM on (and off), anything odd. `usm report` helps too.

@@ -13,7 +13,7 @@ mkdir -p "$STAGE/$NAME" dist
 # Everything a user may need, nothing of a build or an editor.
 tar -c --exclude='__pycache__' --exclude='*.pyc' --exclude='*.o' --exclude='*.ol' --exclude='*.os' --exclude='*.d' \
   --exclude='*.a' --exclude='config-host.*' --exclude='config.log' --exclude='compat.h' --exclude='io_uring_version.h' \
-  README.md LICENSE VERSION CHANGELOG.md Makefile install.sh uninstall.sh vram guard tools system desktop docs \
+  README.md LICENSE THIRD_PARTY_NOTICES.md CONTRIBUTING.md SECURITY.md VERSION CHANGELOG.md Makefile install.sh uninstall.sh vram guard tools system desktop docs \
   third_party tests packaging | tar -x -C "$STAGE/$NAME"
 chmod 755 "$STAGE/$NAME/vram/usm-vramd"
 tar -C "$STAGE" --owner=0 --group=0 --numeric-owner -czf "dist/$NAME.tar.gz" "$NAME"

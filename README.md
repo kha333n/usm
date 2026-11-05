@@ -1,5 +1,11 @@
 # USM: your graphics card's spare memory as RAM overflow
 
+[![CI](https://github.com/kha333n/usm/actions/workflows/ci.yml/badge.svg)](https://github.com/kha333n/usm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kha333n/usm?include_prereleases&label=release)](https://github.com/kha333n/usm/releases)
+[![Status: beta](https://img.shields.io/badge/status-beta-orange)](#beta-read-this-first)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Linux](https://img.shields.io/badge/Linux-NVIDIA%20GPU-76b900?logo=linux&logoColor=white)](#what-you-need)
+
 **Run more apps than your RAM holds, without the slowdown.** USM gives Linux a fast swap tier made of the idle memory
 on your NVIDIA graphics card, and a guard that keeps the desktop responsive when memory runs out. You don't need new
 hardware or kernel patches, and your apps run unchanged.
@@ -141,11 +147,12 @@ was correct. Details, the author's machine with and without USM, and a script to
 - [Test results](docs/test-results.md): data checks, sleep, guard
 - [FAQ](docs/faq.md): games, battery, hibernation, other GPUs and desktops, known limits, roadmap
 
-Bug reports and results from other machines are very welcome. Include `usm check` and `usm version`, and attach
-`usm collect` if you can.
+Bug reports and results from other machines are very welcome: see [Contributing](CONTRIBUTING.md), open a
+[test report](https://github.com/kha333n/usm/issues/new?template=test_report.yml) or
+[bug report](https://github.com/kha333n/usm/issues/new?template=bug_report.yml), or ask in
+[Discussions](https://github.com/kha333n/usm/discussions). Security problems: [SECURITY.md](SECURITY.md).
 
 ## License
 
-[MIT](LICENSE). Includes [liburing](https://github.com/axboe/liburing) (MIT) and the Linux kernel's ublk header
-(GPL-2.0 WITH Linux-syscall-note). NVIDIA, CUDA and GeForce are trademarks of NVIDIA Corporation. USM isn't
-affiliated with NVIDIA, OpenAI or anyone named above.
+[MIT](LICENSE). Third-party code included: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). NVIDIA, CUDA and
+GeForce are trademarks of NVIDIA Corporation. USM isn't affiliated with NVIDIA, OpenAI or anyone named above.

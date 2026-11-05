@@ -1,0 +1,48 @@
+name: 🐛 Bug report
+description: Something went wrong with USM
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The more of the commands below you can paste, the faster it can be fixed.
+        **Security problem?** Please report it privately instead: Security tab → *Report a vulnerability*.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: when
+    attributes:
+      label: When
+      description: Date and time, so it can be found in the logs.
+      placeholder: "2026-11-05 15:34"
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      description: If you know. Which apps were open, what you clicked or ran.
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `usm check`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `usm version` and `usm status`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `usm report` around that time, or attach the file from `usm collect` (`~/usm-logs-*.tar.gz`).
+        Look inside first: it holds app names, memory figures and system details, no file contents.

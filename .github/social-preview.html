@@ -1,0 +1,30 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+<!-- Source of social-preview.png (GitHub: Settings -> General -> Social preview). Render: google-chrome --headless=new --window-size=1280,640 --screenshot=social-preview.png social-preview.html -->
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:1280px;height:640px;overflow:hidden}
+body{font-family:"Inter","Ubuntu","DejaVu Sans",sans-serif;color:#e6edf3;
+ background:radial-gradient(900px 500px at 85% 15%,rgba(118,185,0,.22),transparent 60%),
+            radial-gradient(700px 500px at 0% 100%,rgba(56,139,253,.16),transparent 60%),#0d1117;
+ padding:64px 72px;position:relative}
+.top{display:flex;align-items:center;gap:26px}
+.logo{font-size:150px;font-weight:800;letter-spacing:-6px;line-height:1;
+ background:linear-gradient(135deg,#ffffff 30%,#76b900);-webkit-background-clip:text;color:transparent}
+.ram{font-size:120px;line-height:1;font-family:"Noto Color Emoji"}
+.badge{margin-left:auto;align-self:flex-start;border:2px solid #d29922;color:#d29922;border-radius:999px;
+ padding:8px 22px;font-size:26px;font-weight:700;letter-spacing:1px}
+h1{margin-top:26px;font-size:52px;font-weight:700;line-height:1.15;max-width:1100px}
+h1 span{color:#76b900}
+.flow{margin-top:40px;display:flex;align-items:center;gap:14px;font-size:28px;font-weight:600}
+.chip{padding:12px 22px;border-radius:14px;background:#161b22;border:2px solid #30363d}
+.chip.v{border-color:#76b900;background:rgba(118,185,0,.15);color:#b8f25a}
+.arr{color:#7d8590;font-size:30px}
+.foot{position:absolute;left:72px;right:72px;bottom:52px;display:flex;justify-content:space-between;
+ font-size:26px;color:#9da7b3}
+.foot b{color:#e6edf3;font-weight:600}
+</style></head><body>
+<div class="top"><div class="logo">USM</div><div class="ram">🐏</div><div class="badge">BETA</div></div>
+<h1>Your graphics card's spare memory<br>as <span>fast swap</span> for Linux</h1>
+<div class="flow"><div class="chip">RAM</div><div class="arr">→</div><div class="chip">zswap</div>
+<div class="arr">→</div><div class="chip v">GPU VRAM&nbsp;·&nbsp;~9&nbsp;µs</div><div class="arr">→</div><div class="chip">disk</div></div>
+<div class="foot"><div><b>~7× faster</b> than NVMe swap &nbsp;·&nbsp; desktop stays responsive</div><div><b>github.com/kha333n/usm</b></div></div>
+</body></html>

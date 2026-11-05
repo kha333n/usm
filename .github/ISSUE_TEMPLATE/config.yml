@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 💬 Questions and ideas
+    url: https://github.com/kha333n/usm/discussions
+    about: Ask, share benchmark results, discuss ideas
+  - name: 🔒 Security problem
+    url: https://github.com/kha333n/usm/security/advisories/new
+    about: Report it privately, please not as a public issue
