@@ -51,8 +51,19 @@ sudo ./install.sh
 in your checkout.
 
 To build a release tarball like CI does (in an Ubuntu 22.04 container), run `packaging/build-release.sh`. It needs
-docker or podman (`DOCKER=podman`). The result goes to `dist/`. GitHub releases are made by
-`.github/workflows/release.yml` when a tag `vVERSION` is pushed.
+docker or podman (`DOCKER=podman`). The result goes to `dist/`.
+
+### Making a GitHub release (maintainers)
+
+1. Set the new version in `VERSION` and add its section to `CHANGELOG.md`, then commit and push.
+2. Either create a release on GitHub (*Releases → Draft a new release*, new tag = `v` + the version, e.g.
+   `v0.1.0-beta.1`, then publish), or push the tag: `git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1`.
+3. The *Release* workflow builds the tarball in Ubuntu 22.04, runs the checks and attaches the `.tar.gz` and
+   `.sha256` to the release, after a minute or two. It creates the release if there is none (a pre-release for
+   alpha / beta / rc) and fills in an empty title and notes from `CHANGELOG.md`.
+
+The tag is always `v` + `VERSION` (other tags don't start the workflow). For a tag that already exists, use
+*Actions → Release → Run workflow* and enter the tag.
 
 ## What the installer asks
 

@@ -1,24 +1,43 @@
-# Push a tag vX.Y.Z (= the VERSION file with a v in front) -> GitHub release with the prebuilt tarball.
+# Builds the prebuilt tarball and attaches it to the GitHub release of a tag.
+#
+# Two ways to release (the tag is always v + the VERSION file's content, e.g. v0.1.0-beta.1):
+#   1. On GitHub: Releases -> Draft a new release -> new tag v0.1.0-beta.1 -> Publish.
+#      This workflow then attaches the tarball to that release (and fills in empty title / notes).
+#   2. From git: git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1
+#      This workflow then creates the release (a pre-release for alpha / beta / rc versions).
+# For a tag that already exists: Actions -> Release -> Run workflow -> enter the tag.
 # The daemon is built on Ubuntu 22.04 (glibc 2.35), so the binary also runs on older distributions.
-# Versions with alpha / beta / rc in the name are published as pre-releases.
 name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach the tarball to (e.g. v0.1.0-beta.1)"
+        required: true
 permissions:
   contents: write
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 jobs:
   build:
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Build tools
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc make libc6-dev python3
       - name: The tag matches VERSION
-        run: test "v$(cat VERSION)" = "$GITHUB_REF_NAME"
+        run: |
+          v=$(cat VERSION)
+          if [ "$TAG" != "v$v" ]; then
+            echo "tag $TAG does not match the VERSION file ($v): the tag must be v$v"; exit 1
+          fi
       - name: Build, check, pack
         run: |
           make
@@ -36,16 +55,24 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist
-      - name: Create the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Attach to the release (create it if there is none yet)
         run: |
-          pre=
-          case "$GITHUB_REF_NAME" in *alpha*|*beta*|*rc*) pre=--prerelease ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --repo "$GITHUB_REPOSITORY" \
-            --title "USM ${GITHUB_REF_NAME#v}" --notes-file dist/notes.md $pre
+          R="--repo $GITHUB_REPOSITORY"
+          if gh release view "$TAG" $R > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 $R --clobber
+            # A release made on the website may have no title or notes yet: fill those in, keep anything written.
+            [ -n "$(gh release view "$TAG" $R --json name --jq .name)" ] || gh release edit "$TAG" $R --title "USM ${TAG#v}"
+            [ -n "$(gh release view "$TAG" $R --json body --jq .body)" ] || gh release edit "$TAG" $R --notes-file dist/notes.md
+          else
+            pre=
+            case "$TAG" in *alpha*|*beta*|*rc*) pre=--prerelease ;; esac
+            gh release create "$TAG" dist/*.tar.gz dist/*.sha256 $R --title "USM ${TAG#v}" --notes-file dist/notes.md $pre
+          fi
+          gh release view "$TAG" $R --json url,assets --jq '.url, (.assets[].name)'
