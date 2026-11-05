@@ -2,9 +2,10 @@
 # usm-vramd-ctl: switch the VRAM swap tier (user-space program version) on or off.
 #
 #   usm-vramd-ctl on [VRAM_MB=4096] [POLL_US=0]      (env USM_VRAM_QUEUES=4, USM_VRAM_COMPRESS=RATIO)
-#        USM_VRAM_COMPRESS=2: compressed mode, the swap device is 2x the VRAM it uses (lz4 on the CPU);
-#        what does not fit in the VRAM (data that does not compress) overflows into the spill file
+#        USM_VRAM_COMPRESS=2: compressed mode, the swap device is 2x the VRAM it uses (lz4 on the CPU)
 #        start usm-vramd (borrows VRAM through CUDA) and make its device the top-priority swap.
+#        Also makes the standby swap file ($USM_VRAM_SPILL_DIR/standby-N.swap, USM_VRAM_STANDBY_MB=auto|0|MiB):
+#        the program switches it on above its device while the VRAM is nearly full or data is on disk.
 #        If an earlier "off" left the data in the spill file: copy it back into VRAM instead.
 #   usm-vramd-ctl off
 #        give the VRAM back:
@@ -28,9 +29,10 @@ PRIO=${USM_VRAM_PRIO:-200}           # above zram (100): the kernel fills VRAM f
 MARK=/run/usm-vramd.loaded-ublk      # we loaded ublk_drv, so "off" unloads it again
 INV=/run/usm-vramd.invocation        # systemd invocation id of the running daemon
 PM=/run/usm-vramd.gpu-power          # the GPU's runtime power setting before "on"
-SPILL_DIR=${USM_VRAM_SPILL_DIR:-/var/lib/usm-swap}
+SPILL_DIR=$(realpath -m "${USM_VRAM_SPILL_DIR:-/var/lib/usm-swap}")   # as /proc/swaps shows paths
 SPILL=$SPILL_DIR/vram-spill
-ARGS=/run/usm-vramd.args             # how "on" was called (VRAM_MB POLL QUEUES COMPRESS SPILL_DIR [test memory])
+STANDBY_MB=${USM_VRAM_STANDBY_MB:-auto}
+ARGS=/run/usm-vramd.args             # how "on" was called (VRAM_MB POLL QUEUES COMPRESS SPILL_DIR STANDBY_MB [test memory])
 SLEEP_ARGS=/run/usm-vramd.sleep-args # the tier was on when the machine went to sleep
 SD=${USM_VRAM_HOOK_DIR:-/run/systemd/system}   # runtime units: gone at reboot, like the tier itself
 STATS=/run/usm-vramd.stats           # the program's status line (every 5 s)
@@ -61,6 +63,66 @@ spilled() {
 }
 in_swap() { [ -n "$1" ] && grep -q "^$1 " /proc/swaps; }
 used_mib() { awk -v d="$1" '$1 == d {print int($4 / 1024)}' /proc/swaps; }
+
+# The standby swap (see usm-vramd.c, "the standby swap"): ordinary swap files. The program switches them
+# on above its own device while the VRAM is nearly full or data is in the spill file, so the kernel writes
+# new pages to the disk itself; the program never has to wait for the disk while it serves swap.
+# This makes the first one, $SPILL_DIR/standby-N.swap; the program adds standby-N-2.swap ... while needed.
+# N = 1 or 2: a leftover that still holds pages (an earlier run, switched off while RAM was full) can stay on.
+standby_in_use() {   # standby_in_use N: a file of set N is on
+  local f
+  for f in "$SPILL_DIR/standby-$1.swap" "$SPILL_DIR/standby-$1"-*.swap; do in_swap "$f" && return 0; done
+  return 1
+}
+# A fresh one, made and tried out (swapon, swapoff); prints its path, or nothing (none: warning on stderr).
+standby_make() {   # standby_make VRAM_MB
+  local want=$STANDBY_MB f= n avail fs
+  [ "$want" = 0 ] && return 0
+  if [ "$want" = auto ]; then want=$1; [ "$want" -gt 4096 ] && want=4096; fi
+  for n in 1 2; do
+    if ! standby_in_use $n; then f=$SPILL_DIR/standby-$n.swap; break; fi
+  done
+  if [ -z "$f" ]; then echo "warning: both standby swap sets are still in use - none this time" >&2; return 0; fi
+  rm -f "$f" "${f%.swap}"-*.swap
+  avail=$(df --output=avail -m "$SPILL_DIR" | tail -1 | tr -d ' ')
+  # auto: at most a quarter of the free disk space; always leave 1 GiB free.
+  if [ "$STANDBY_MB" = auto ] && [ $(( avail / 4 )) -lt "$want" ]; then want=$(( avail / 4 )); fi
+  if [ $(( avail - 1024 )) -lt "$want" ]; then want=$(( avail - 1024 )); fi
+  if [ "$want" -lt 256 ]; then
+    echo "warning: only $avail MiB free in $SPILL_DIR - no standby swap (see STANDBY_MB)" >&2; return 0
+  fi
+  fs=$(stat -f -c %T "$SPILL_DIR")
+  touch "$f"; chmod 600 "$f"
+  if [ "$fs" = btrfs ]; then chattr +C "$f" 2> /dev/null || true; fi   # a swap file on btrfs: no copy-on-write
+  if fallocate -l "${want}M" "$f" 2> /dev/null && mkswap -L usmstandby "$f" > /dev/null 2>&1 &&
+     swapon -p 0 "$f" 2> /dev/null && swapoff "$f"; then
+    echo "$f"
+  else
+    rm -f "$f"
+    echo "warning: cannot make a standby swap file in $SPILL_DIR ($fs) - see STANDBY_MB" >&2
+  fi
+  return 0
+}
+
+# Standby files no program uses any more: empty ones go; one that holds pages goes once they fit in RAM.
+standby_cleanup() {
+  local f
+  for f in "$SPILL_DIR"/standby-*.swap; do
+    [ -e "$f" ] || continue
+    if ! in_swap "$f"; then rm -f "$f"; continue; fi
+    if [ "$(used_mib "$f")" = 0 ] && swapoff "$f" 2> /dev/null; then rm -f "$f"; continue; fi
+    if "$HERE/usm-vram-move.py" "$f"; then rm -f "$f"; continue; fi
+    echo "standby swap $f keeps $(used_mib "$f") MiB: stays on until RAM has room for them (usm on / off try again)"
+  done
+  return 0
+}
+standby_status() {
+  local f
+  for f in "$SPILL_DIR"/standby-*.swap; do
+    in_swap "$f" && awk -v d="$f" '$1 == d {printf "  standby swap on: %s, %d of %d MiB used, priority %s\n", d, $4 / 1024, $3 / 1024, $5}' /proc/swaps
+  done
+  return 0
+}
 
 # Send a request to the program and wait for its answer (a spill or fill takes seconds to minutes).
 ask() {   # ask SIGNAL ANSWER_REGEX
@@ -152,6 +214,7 @@ full_stop() {
   rm -f $ARGS $STATS $DEVF
   [ -n "${IN_SLEEP:-}" ] || uninstall_hooks
   echo "VRAM swap off (VRAM released)"
+  [ -n "${IN_SLEEP:-}" ] || standby_cleanup   # before sleep: no time for it (done at the next start)
 }
 
 # One change at a time: on / off / drain wait for each other (e.g. "off" while the background
@@ -186,9 +249,11 @@ on)
     u=$(awk -v f="$f" '$1 == f {print $4}' /proc/swaps)
     if [ -z "$u" ]; then rm -f "$f"; elif [ "$u" -lt 1024 ]; then swapoff "$f" && rm -f "$f"; fi
   done
-  # VRAM must be the first swap, above anything else.
+  standby_cleanup
+  # VRAM must be the first swap, above anything else (but its standby swap).
   top=$(awk 'NR > 1 && $5 > m {m = $5} END {print m + 0}' /proc/swaps)
-  [ "$PRIO" -le "$top" ] && PRIO=$(( top + 100 > 32767 ? 32767 : top + 100 ))
+  [ "$PRIO" -le "$top" ] && PRIO=$(( top + 100 > 32766 ? 32766 : top + 100 ))
+  SB=$(standby_make "${2:-4096}")
   # Test mode (no GPU): device memory from a PCI BAR, e.g. QEMU ivshmem in the test VM.
   if [ -n "${USM_VRAMD_FAKE:-}" ]; then echo 1 > "$(dirname "$USM_VRAMD_FAKE")/enable"; fi
   gpu=$(gpu_pci)
@@ -201,6 +266,7 @@ on)
   systemd-run -q --unit=$UNIT --collect -p DefaultDependencies=no -p OOMScoreAdjust=-1000 \
     ${USM_VRAMD_FAKE:+-E USM_VRAMD_FAKE=$USM_VRAMD_FAKE} -E USM_VRAMD_SPILL="$SPILL" \
     ${USM_VRAM_COMPRESS:+-E USM_VRAMD_COMPRESS=$USM_VRAM_COMPRESS} -E USM_VRAMD_STATS=$STATS \
+    ${SB:+-E USM_VRAMD_STANDBY=$SB -E USM_VRAMD_STANDBY_PRIO=$((PRIO + 1))} \
     "$HERE/usm-vramd" "${2:-4096}" "${USM_VRAM_QUEUES:-4}" 32 "${3:-0}"
   systemctl show -p InvocationID --value $UNIT > $INV
   dev=
@@ -223,9 +289,11 @@ on)
   mkswap -L usmvram "$dev" > /dev/null
   # Compressed mode: swap tells the program which pages it no longer needs (their space is reused).
   swapon -p "$PRIO" ${USM_VRAM_COMPRESS:+--discard=pages} "$dev"
-  echo "${2:-4096} ${3:-0} ${USM_VRAM_QUEUES:-4} ${USM_VRAM_COMPRESS:-0} $SPILL_DIR ${USM_VRAMD_FAKE:-}" > $ARGS
+  echo "${2:-4096} ${3:-0} ${USM_VRAM_QUEUES:-4} ${USM_VRAM_COMPRESS:-0} $SPILL_DIR $STANDBY_MB ${USM_VRAMD_FAKE:-}" > $ARGS
   install_hooks
   echo "VRAM swap on: $dev, $(( $(blockdev --getsize64 "$dev") >> 20 )) MiB at priority $PRIO"
+  if [ -n "$SB" ]; then echo "standby swap: $SB, $(( $(stat -c %s "$SB") >> 20 )) MiB (priority $((PRIO + 1)) while in use)"
+  else echo "no standby swap: a full VRAM refuses writes, and switching off needs room in RAM"; fi
   ;;
 off)
   dev=$(device)
@@ -275,7 +343,7 @@ sleep)   # before suspend/hibernate: fully off; exit 1 = cannot (the sleep is th
   systemctl is-active -q $UNIT || exit 0
   dev=$(device)
   # Back on after waking - unless the user had switched it off already (spilled, draining).
-  if ! spilled; then cp $ARGS $SLEEP_ARGS 2>/dev/null || echo "4096 0 4 0 $SPILL_DIR" > $SLEEP_ARGS; fi
+  if ! spilled; then cp $ARGS $SLEEP_ARGS 2>/dev/null || echo "4096 0 4 0 $SPILL_DIR auto" > $SLEEP_ARGS; fi
   if in_swap "$dev"; then
     echo "going to sleep: moving $(used_mib "$dev") MiB out of the VRAM tier"
     "$HERE/usm-vram-move.py" "$dev" || {
@@ -288,11 +356,12 @@ sleep)   # before suspend/hibernate: fully off; exit 1 = cannot (the sleep is th
   ;;
 wake)    # after resume: back on as before
   [ -e $SLEEP_ARGS ] || exit 0
-  read -r mb poll queues compress spilldir fake < $SLEEP_ARGS
+  read -r mb poll queues compress spilldir standby fake < $SLEEP_ARGS
   rm -f $SLEEP_ARGS
   [ "$compress" = 0 ] && compress=
+  case "${standby:-}" in /*) fake=$standby; standby=auto ;; "") standby=auto ;; esac   # written by 0.1.0-beta.1
   exec 9>&-   # "on" takes the lock itself
-  USM_VRAM_QUEUES=$queues USM_VRAM_COMPRESS=$compress USM_VRAM_SPILL_DIR=$spilldir USM_VRAMD_FAKE=$fake \
+  USM_VRAM_QUEUES=$queues USM_VRAM_COMPRESS=$compress USM_VRAM_SPILL_DIR=$spilldir USM_VRAM_STANDBY_MB=$standby USM_VRAMD_FAKE=$fake \
     "$HERE/usm-vramd-ctl" on "$mb" "$poll"
   ;;
 hooks-install|hooks-remove)
@@ -316,13 +385,16 @@ status)
         else
           printf "  not compressed"
         printf "; segments in VRAM %d MiB, on disk %d MiB; %d reads, %d writes, %d errors", v["in_vram_mb"], v["on_disk_mb"], v["reads"], v["writes"], v["errors"]
-        if (v["refused"] + 0 > 0) printf "; %d writes REFUSED (full)", v["refused"]
+        if (v["refused"] + 0 > 0) printf "; %d writes refused (no room)", v["refused"]
         printf "\n" }'
     fi
+    standby_status
   elif systemctl is-active -q $UNIT; then
     echo "daemon running ($dev), not in use as swap"
+    standby_status
   else
     echo "off"
+    standby_status
   fi
   ;;
 *)

@@ -22,7 +22,7 @@ links only against libc (glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+, Fedora 
 distribution.
 
 ```bash
-VERSION=0.1.0-beta.1
+VERSION=0.1.0-beta.2
 curl -LO https://github.com/kha333n/usm/releases/download/v$VERSION/usm-$VERSION-linux-x86_64.tar.gz
 curl -LO https://github.com/kha333n/usm/releases/download/v$VERSION/usm-$VERSION-linux-x86_64.tar.gz.sha256
 sha256sum -c usm-$VERSION-linux-x86_64.tar.gz.sha256
@@ -57,7 +57,7 @@ docker or podman (`DOCKER=podman`). The result goes to `dist/`.
 
 1. Set the new version in `VERSION` and add its section to `CHANGELOG.md`, then commit and push.
 2. Either create a release on GitHub (*Releases → Draft a new release*, new tag = `v` + the version, e.g.
-   `v0.1.0-beta.1`, then publish), or push the tag: `git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1`.
+   `v0.1.0-beta.2`, then publish), or push the tag: `git tag v0.1.0-beta.2 && git push origin v0.1.0-beta.2`.
 3. The *Release* workflow builds the tarball in Ubuntu 22.04, runs the checks and attaches the `.tar.gz` and
    `.sha256` to the release, after a minute or two. It creates the release if there is none (a pre-release for
    alpha / beta / rc) and fills in an empty title and notes from `CHANGELOG.md`.
@@ -124,7 +124,7 @@ effect after `usm off && usm on`, or a reboot. All settings: [configuration.md](
 | settings | `/etc/usm/usm.conf` |
 | services | `/etc/systemd/system/usm-vram.service`, `usm-guard.service`, `usm-logger.service` (+ sleep hooks) |
 | logs | `/var/log/usm/` (30 days, at most 300 MiB) |
-| overflow / spill file | `/var/lib/usm-swap/` |
+| standby swap file, spill file | `/var/lib/usm-swap/` |
 | GNOME extension | `/usr/local/share/gnome-shell/extensions/usm-desktop@usm/` |
 | polkit rule (desktop switches without a password) | `/usr/share/polkit-1/actions/org.usm.switch.policy` |
 

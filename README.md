@@ -94,6 +94,7 @@ RAM (zswap), then the GPU's memory, and the disk only for what still doesn't fit
 | **Linux** | systemd, cgroup v2, kernel with `ublk_drv`, Python 3.10+. Tested: Ubuntu 26.04 (kernel 7.0). Should work: Ubuntu 24.04+, Debian 13, Fedora, Arch (not tested yet) |
 | **GPU** | NVIDIA with the NVIDIA driver (proprietary or open). No CUDA toolkit needed. AMD and Intel: not yet. Without one, you still get the guard and the logger |
 | **Desktop** | GNOME 45–50 for the guard and the Quick Settings menu. Other desktops and servers: tier and logger only |
+| **Disk** | Free space for the standby swap file: as big as the VRAM used, at most 4 GiB (`STANDBY_MB`), more only while it's needed |
 
 **Help it grow:** you can help with development, and with testing on more systems and GPUs: other distributions,
 other NVIDIA cards, and AMD and Intel GPUs, which need a new backend. Test results, bug reports and pull requests
@@ -103,8 +104,8 @@ are all welcome, and we'll keep widening support over time too. See [Docs](#docs
 
 ```bash
 # prebuilt release (https://github.com/kha333n/usm/releases):
-curl -LO https://github.com/kha333n/usm/releases/download/v0.1.0-beta.1/usm-0.1.0-beta.1-linux-x86_64.tar.gz
-tar xzf usm-0.1.0-beta.1-linux-x86_64.tar.gz && cd usm-0.1.0-beta.1-linux-x86_64
+curl -LO https://github.com/kha333n/usm/releases/download/v0.1.0-beta.2/usm-0.1.0-beta.2-linux-x86_64.tar.gz
+tar xzf usm-0.1.0-beta.2-linux-x86_64.tar.gz && cd usm-0.1.0-beta.2-linux-x86_64
 sudo ./install.sh
 
 # or from source:

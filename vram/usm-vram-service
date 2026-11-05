@@ -73,7 +73,7 @@ start)
   fi
   # The sleep/wake hooks are installed for good (install.sh), not at run time.
   env USM_VRAM_NO_SLEEP_HOOK=1 USM_VRAM_QUEUES="${QUEUES:-4}" USM_VRAM_COMPRESS="$c" \
-    USM_VRAM_SPILL_DIR="${SPILL_DIR:-/var/lib/usm-swap}" \
+    USM_VRAM_SPILL_DIR="${SPILL_DIR:-/var/lib/usm-swap}" USM_VRAM_STANDBY_MB="${STANDBY_MB:-auto}" \
     USM_VRAMD_FAKE="${TEST_DEVICE_MEMORY:-}" "$HERE/usm-vramd-ctl" on "$mb" || exit
   zswap_tier
   readahead_tier ;;

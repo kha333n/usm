@@ -26,10 +26,15 @@
 //   SIGUSR2  fill: get VRAM again, copy the data back from FILE, delete FILE
 // The data moves in 1 MiB chunks, straight between VRAM and the disk: no RAM is needed for it, so
 // this works when RAM is full (unlike swapoff, which must bring every page into RAM first).
+//
+// Standby swap (USM_VRAMD_STANDBY=FILE, USM_VRAMD_STANDBY_PRIO=N, a swap file made by usm-vramd-ctl):
+// switched on above this device whenever the VRAM is nearly full or data is in the spill file, so the
+// kernel itself writes new pages to the disk. See "the standby swap" below for why that matters.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <liburing.h>
 #include <malloc.h>
 #include <linux/ublk_cmd.h>
@@ -45,7 +50,11 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/swap.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -245,6 +254,12 @@ static pthread_rwlock_t move_lock;
 static const char *spill_path;   // USM_VRAMD_SPILL
 static int spill_fd = -1;        // open while any chunk lives in the file
 static int vram_held = 1;        // the VRAM allocation exists (released after a full spill)
+// Our own disk I/O is allowed only while this is set: the standby swap is on and has room (see "the
+// standby swap"). Without it, writes that would go to the spill file are refused instead.
+static int sb_room_ok;
+static unsigned long long st_full;   // writes refused (VRAM full, or the disk not safe to use now)
+static size_t sb_on_free, sb_off_free;   // compressed mode: free VRAM segments at which the standby goes on / may go off
+static void want_standby(void);
 
 static void queue_io_cmd(struct queue *q, unsigned op, int tag, int result) {
     struct io_uring_sqe *sqe = get_sqe128(&q->ring);
@@ -332,6 +347,9 @@ static int dev_io(struct queue *q, int to_dev, unsigned long long off, char *buf
         int r;
         if (st == C_VRAM || st == C_TO_FILE) {
             r = dev_copy(q, to_dev, off, buf, n);
+        } else if (to_dev && !__atomic_load_n(&sb_room_ok, __ATOMIC_RELAXED)) {
+            __atomic_add_fetch(&st_full, 1, __ATOMIC_RELAXED);   // the kernel keeps the page in RAM
+            r = -1;
         } else {
             r = file_io(to_dev, off, buf, n);
             if (to_dev)
@@ -356,31 +374,25 @@ static int dev_io(struct queue *q, int to_dev, unsigned long long off, char *buf
 // pages leave dead bytes; the mover compacts mostly-dead segments (copies their live pages into a
 // fresh one) so they can be reused. Segments are the chunks of spill/fill, so a compressed device
 // spills to disk like a plain one. A read copies just the compressed bytes and decompresses them.
+// When the VRAM runs full (data that does not compress well), the standby swap takes new pages and
+// the room left takes rewrites; with no room at all a write is refused (the kernel keeps that page in RAM).
+// Nothing ever goes to a file from here unless the device was spilled.
 #define PG 4096u
 #define E_PRESENT (1ull << 63)
 #define E_ZERO (1ull << 62)
 #define SEG_RESERVE 2                  // free segments only the compactor may take
-#define OVER_RESERVE 2                 // overflow segments only the compactor may take
 enum { S_FREE = -1, S_CLOSED = 0, S_VICTIM = -2 };   // seg_open: else 1..nr_queues (open), nr_queues+1 (compactor)
 static double cz_ratio;                // 0 = plain mode
 static size_t dev_bytes;               // size of the device (plain mode: vram_bytes)
 static uint64_t *pmap;                 // per page: E_PRESENT [E_ZERO] | seg << 29 | (off / 16) << 13 | (len - 1)
 static uint32_t *seg_live;             // live bytes per segment
 static int *seg_open;
-static uint32_t *free_segs;            // stack of free VRAM segments
+static uint32_t *free_segs;            // stack of free segments
 static size_t free_n, gc_low, gc_high;
-// Overflow: when the VRAM is full (data that does not compress well), new segments go to the spill
-// file instead - VRAM first, then the disk, inside one device. Overflow segments are numbered after
-// the VRAM ones and always live in the file (at seg * CHUNK). The mover reserves their disk space in
-// advance (OVER_READY at a time), so serving never waits for the file system to allocate.
-#define OVER_READY 32
-static size_t nr_segs;                 // all segments: VRAM (0 .. nr_chunks-1) + overflow
-static uint32_t *over_free;            // overflow segments with space reserved, not in use
-static size_t over_n, over_next;       // ... how many; the next one never reserved yet
 static pthread_mutex_t seg_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t seg_cv = PTHREAD_COND_INITIALIZER;   // the compactor freed segments
 static struct queue *all_queues;
-static unsigned long long st_zero, st_raw, st_comp, st_comp_bytes, st_full, st_discard, st_gc_runs, st_gc_bytes;
+static unsigned long long st_zero, st_raw, st_comp, st_comp_bytes, st_discard, st_gc_runs, st_gc_bytes;
 static void want_gc(void);
 
 static inline uint64_t ent(size_t seg, unsigned off, unsigned len) {
@@ -394,10 +406,7 @@ static inline int e_stored(uint64_t e) { return (e & E_PRESENT) && !(e & E_ZERO)
 static void seg_push_free(size_t s) {
     __atomic_store_n(&chunk_written[s], 0, __ATOMIC_RELAXED);   // nothing in it for a spill to copy
     pthread_mutex_lock(&seg_mx);
-    if (s >= nr_chunks)
-        over_free[over_n++] = (uint32_t)s;
-    else
-        free_segs[free_n++] = (uint32_t)s;
+    free_segs[free_n++] = (uint32_t)s;
     pthread_cond_broadcast(&seg_cv);
     pthread_mutex_unlock(&seg_mx);
 }
@@ -424,16 +433,16 @@ static long seg_alloc(int owner, size_t reserve) {
     pthread_mutex_lock(&seg_mx);
     if (free_n > reserve)
         s = free_segs[--free_n];
-    else if (over_n > OVER_RESERVE)   // VRAM full: a segment in the spill file
-        s = over_free[--over_n];
-    int low = free_n < gc_low || (nr_segs > nr_chunks && free_n < gc_high && over_n < OVER_READY / 2 + OVER_RESERVE);
+    size_t left = free_n;
     pthread_mutex_unlock(&seg_mx);
     if (s >= 0) {
         __atomic_store_n(&seg_open[s], owner, __ATOMIC_RELEASE);
         __atomic_store_n(&chunk_written[s], 1, __ATOMIC_RELAXED);   // in use: a spill copies it
     }
-    if (low)   // compact the VRAM, and reserve overflow space on disk in time
+    if (left < gc_low)   // compact the VRAM
         want_gc();
+    if (left < sb_on_free)   // nearly full: the standby swap takes new pages from now on
+        want_standby();
     return s;
 }
 
@@ -460,6 +469,10 @@ static int seg_write(struct queue *q, size_t s, char *buf) {
         __atomic_store_n(&chunk_dirty[s], 1, __ATOMIC_RELAXED);
     if (st == C_VRAM || st == C_TO_FILE)
         return dev_copy(q, 1, (unsigned long long)s * CHUNK, buf, CHUNK) || dev_sync(q) ? -1 : 0;
+    if (!__atomic_load_n(&sb_room_ok, __ATOMIC_RELAXED)) {   // spilled, and the disk is not safe to use now
+        __atomic_add_fetch(&st_full, 1, __ATOMIC_RELAXED);
+        return -1;
+    }
     q->file_writes++;
     return file_io(1, (unsigned long long)s * CHUNK, buf, CHUNK);
 }
@@ -809,9 +822,7 @@ static int stage_copy(int to_vram, size_t c) {
 // after every batch that started before has finished (taking the batch lock for writing once).
 #define GC_VICTIMS 16
 static int gc_wanted;
-// The compactor's open segments: [0] collects pages from VRAM segments (into a VRAM segment),
-// [1] from overflow segments (into an overflow segment). Each tier is compacted into itself: pulling
-// disk data into a full VRAM would only make more compaction, in a loop.
+// The compactor's open segment.
 struct gc_move { size_t page; uint64_t old, neu; size_t from; };
 static struct gc_dest {
     long seg;
@@ -819,7 +830,7 @@ static struct gc_dest {
     char *buf;                 // CHUNK of pinned RAM
     struct gc_move *moves;     // pages copied into buf, not visible yet
     size_t n;
-} gdst[2] = {{.seg = -1}, {.seg = -1}};
+} gdst = {.seg = -1};
 
 static void want_gc(void) {
     if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))
@@ -837,21 +848,11 @@ static size_t free_count(void) {
     return n;
 }
 
-// Overflow segments still to be had: reserved and free, plus never reserved yet.
-static size_t over_avail(void) {
-    pthread_mutex_lock(&seg_mx);
-    size_t n = over_n + (nr_segs - over_next);
-    pthread_mutex_unlock(&seg_mx);
-    return n;
-}
-
-static long gc_seg_alloc(int over) {
+static long gc_seg_alloc(void) {
     long s = -1;
     pthread_mutex_lock(&seg_mx);
-    if (!over && free_n)
+    if (free_n)
         s = free_segs[--free_n];
-    else if (over && over_n)
-        s = over_free[--over_n];
     pthread_mutex_unlock(&seg_mx);
     if (s >= 0) {
         __atomic_store_n(&seg_open[s], nr_queues + 1, __ATOMIC_RELEASE);
@@ -887,17 +888,15 @@ static void gc_flush(struct gc_dest *d, int close) {
     }
 }
 
-// One round in one tier (over: 0 = VRAM segments, 1 = overflow segments): up to GC_VICTIMS of its
-// mostly-dead segments. Returns how many were taken.
-static int gc_pass(int over) {
-    struct gc_dest *d = &gdst[over];
-    size_t lo = over ? nr_chunks : 0, hi = over ? nr_segs : nr_chunks;
+// One round: up to GC_VICTIMS mostly-dead segments. Returns how many were taken.
+static int gc_pass(void) {
+    struct gc_dest *d = &gdst;
     size_t victims[GC_VICTIMS];
     int nv = 0, stuck = 0;
     while (nv < GC_VICTIMS && !stuck) {
         long v = -1;
         uint32_t best = CHUNK * 2 / 3;   // more live than this: copying costs more than it frees
-        for (size_t c = lo; c < hi; c++)
+        for (size_t c = 0; c < nr_chunks; c++)
             if (__atomic_load_n(&seg_open[c], __ATOMIC_ACQUIRE) == S_CLOSED &&
                 __atomic_load_n(&seg_live[c], __ATOMIC_ACQUIRE) < best) {
                 best = __atomic_load_n(&seg_live[c], __ATOMIC_ACQUIRE);
@@ -919,7 +918,7 @@ static int gc_pass(int over) {
             unsigned len = e_len(e), room = (len + 15) & ~15u;
             if (d->seg < 0 || d->fill + room > CHUNK) {
                 gc_flush(d, 1);
-                d->seg = gc_seg_alloc(over);
+                d->seg = gc_seg_alloc();
                 d->fill = 0;
                 if (d->seg < 0) {   // not even one free segment: stop here (the rest stays put)
                     stuck = 1;
@@ -944,39 +943,349 @@ static int gc_pass(int over) {
     return stuck ? 0 : nv;
 }
 
-// Reserve disk space for a few more overflow segments while the VRAM is running full.
-static void over_prepare(void) {
-    while (spill_fd >= 0 && over_next < nr_segs) {
-        pthread_mutex_lock(&seg_mx);
-        int enough = over_n >= OVER_READY || free_n >= gc_high;
-        pthread_mutex_unlock(&seg_mx);
-        if (enough)
-            break;
-        if (fallocate(spill_fd, 0, (off_t)over_next * CHUNK, CHUNK)) {
-            static int told;
-            if (!told++)
-                printf("overflow: cannot reserve disk space in %s: %s\n", spill_path, strerror(errno));
-            break;
-        }
-        pthread_mutex_lock(&seg_mx);
-        over_free[over_n++] = (uint32_t)over_next++;
-        pthread_mutex_unlock(&seg_mx);
-    }
-}
-
 static void gc(void) {
     __atomic_store_n(&gc_wanted, 0, __ATOMIC_RELAXED);
     if (!cz_ratio)
         return;
     for (int round = 0; round < 64 && free_count() < gc_high; round++)
-        if (!gc_pass(0))
+        if (!gc_pass())
             break;
-    over_prepare();
-    // Overflow running out (all reserved, mostly dead pages): compact it within the disk.
-    size_t over_low = (nr_segs - nr_chunks) / 16 > OVER_READY ? (nr_segs - nr_chunks) / 16 : OVER_READY;
-    for (int round = 0; round < 64 && nr_segs > nr_chunks && over_avail() < over_low; round++)
-        if (!gc_pass(1))
+}
+
+// ---- the standby swap ----
+// The one way this program could hang the whole machine: waiting for the disk while serving swap.
+// Reading or writing a file needs a little kernel memory. When memory has run out, that memory only
+// comes back once swap writes finish - and if all of them wait for us, nothing ever finishes.
+// So we touch the disk only while the kernel has another way to free memory: the standby swap,
+// ordinary swap files switched on at a priority above our device. Swap writes then go there, through
+// the kernel's own swap code, which is built to work with no free memory left; ours can wait.
+// It is on (1) while the VRAM is nearly full: new pages then go to the disk, and the room left in
+// the VRAM takes rewrites of pages already here, and (2) while any data is in the spill file.
+// While it is off or full, writes that would need the disk are refused (the kernel keeps those pages
+// in RAM) and the mover never makes the queues wait for the disk. When it fills up while needed, one
+// more file of the same size is added (as long as the disk keeps 10% free, at least 2 GiB).
+// It goes off again once the VRAM has room and its pages fit in RAM (swapoff, called off if RAM or
+// VRAM get short meanwhile); the files added go away then.
+enum { SB_NONE, SB_OFF, SB_ON, SB_GOING_OFF };
+static const char *sb_names[] = {"none", "off", "on", "going-off"};
+#define SB_FILES 16
+static char sb_paths[SB_FILES][PATH_MAX];   // [0] USM_VRAMD_STANDBY (made by usm-vramd-ctl), then the ones added
+static int sb_n = 1;                        // how many: while on, all of them are on; while off, only [0] exists
+static long long sb_step;                   // bytes: the size of [0], and of each one added
+static int sb_prio;                         // USM_VRAMD_STANDBY_PRIO: above our device's
+static int sb_state = SB_NONE;
+static pthread_mutex_t sb_mx = PTHREAD_MUTEX_INITIALIZER;   // state, sb_n (held across swapon)
+static pthread_cond_t sb_cv = PTHREAD_COND_INITIALIZER;     // a swapoff of it finished
+static pthread_t sb_worker;                                 // runs that swapoff
+static double sb_retry_on, sb_retry_off, sb_retry_grow;     // now_us(): not before
+static pthread_mutex_t sb_wake_mx = PTHREAD_MUTEX_INITIALIZER;   // only for waking the controller
+static pthread_cond_t sb_wake_cv = PTHREAD_COND_INITIALIZER;
+static int sb_wake, sb_quit;
+
+static void want_standby(void) {
+    if (__atomic_load_n(&sb_wake, __ATOMIC_RELAXED) || __atomic_load_n(&sb_state, __ATOMIC_RELAXED) == SB_NONE)
+        return;
+    pthread_mutex_lock(&sb_wake_mx);
+    sb_wake = 1;
+    pthread_cond_signal(&sb_wake_cv);
+    pthread_mutex_unlock(&sb_wake_mx);
+}
+
+static void on_sigurg(int sig) {   // only there to interrupt the swapoff of the standby swap
+    (void)sig;
+}
+
+static void timeout_in(struct timespec *t, long ms) {
+    clock_gettime(CLOCK_REALTIME, t);
+    t->tv_nsec += ms * 1000000L;
+    t->tv_sec += t->tv_nsec / 1000000000L;
+    t->tv_nsec %= 1000000000L;
+}
+
+// A small file of /proc into buf (no malloc: this runs when memory is short).
+static int read_proc(const char *name, char *buf, size_t size) {
+    int fd = open(name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    size_t n = 0;
+    ssize_t r;
+    while (n + 1 < size && (r = read(fd, buf + n, size - 1 - n)) > 0)
+        n += (size_t)r;
+    close(fd);
+    buf[n] = 0;
+    return 0;
+}
+
+// Size and use (KiB) of the standby files that are on; returns how many are (caller holds sb_mx).
+static int sb_usage(long long *size, long long *used) {
+    char buf[8192], name[PATH_MAX];
+    long long sz, us;
+    int found = 0;
+    *size = *used = 0;
+    if (read_proc("/proc/swaps", buf, sizeof buf))
+        return 0;
+    for (char *l = strchr(buf, '\n'); l && *++l; l = strchr(l, '\n'))
+        if (sscanf(l, "%4095s %*s %lld %lld", name, &sz, &us) == 3)
+            for (int i = 0; i < sb_n; i++)
+                if (!strcmp(name, sb_paths[i])) {
+                    *size += sz;
+                    *used += us;
+                    found++;
+                }
+    return found;
+}
+
+static long long meminfo_kib(const char *key) {
+    char buf[4096];
+    if (read_proc("/proc/meminfo", buf, sizeof buf))
+        return -1;
+    const char *p = strstr(buf, key);
+    return p ? strtoll(p + strlen(key), NULL, 10) : -1;
+}
+
+// RAM below this much available: too short to take the standby's pages back (KiB).
+static long long ram_low_kib(void) {
+    long long total = meminfo_kib("MemTotal:");
+    return total / 25 > 262144 ? total / 25 : 262144;
+}
+
+// Is there room on the standby swap for what the kernel may still send there? Returns its free KiB
+// (caller holds sb_mx).
+static long long sb_update_room(void) {
+    long long size = 0, used = 0;
+    int on = sb_state == SB_ON && sb_usage(&size, &used);
+    long long margin = size / 16 > 65536 ? size / 16 : 65536;   // 1/16 of it, at least 64 MiB
+    __atomic_store_n(&sb_room_ok, on && size - used >= margin, __ATOMIC_RELEASE);
+    return on ? size - used : 0;
+}
+
+static int sb_swapon(const char *path) {
+    return !swapon(path, SWAP_FLAG_PREFER | (sb_prio & SWAP_FLAG_PRIO_MASK)) || errno == EBUSY ? 0 : -1;
+}
+
+// Make sure the standby swap is on. Returns 1 if it is.
+static int standby_on(const char *why) {
+    pthread_mutex_lock(&sb_mx);
+    while (sb_state == SB_GOING_OFF) {   // call off the swapoff of it under way
+        pthread_kill(sb_worker, SIGURG);
+        struct timespec t;
+        timeout_in(&t, 50);
+        pthread_cond_timedwait(&sb_cv, &sb_mx, &t);
+    }
+    if (sb_state == SB_OFF && now_us() >= sb_retry_on) {
+        if (!sb_swapon(sb_paths[0])) {
+            __atomic_store_n(&sb_state, SB_ON, __ATOMIC_RELEASE);
+            sb_retry_off = now_us() + 30e6;   // not off again right away
+            printf("standby swap on: %s at priority %d (%s)\n", sb_paths[0], sb_prio, why);
+        } else {
+            printf("standby swap: cannot switch %s on: %s\n", sb_paths[0], strerror(errno));
+            sb_retry_on = now_us() + 10e6;
+        }
+    }
+    int on = sb_state == SB_ON;
+    if (on) {
+        sb_update_room();
+        if (sb_retry_off < now_us() + 30e6)   // whoever needs it now: not off again for a while
+            sb_retry_off = now_us() + 30e6;
+    }
+    pthread_mutex_unlock(&sb_mx);
+    return on;
+}
+
+// mkswap: the header page of a swap file of this many bytes.
+static int write_swap_header(int fd, long long bytes) {
+    static char page[65536];   // only the controller uses it
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0 || ps > (long)sizeof page)
+        return -1;
+    memset(page, 0, (size_t)ps);
+    uint32_t info[3] = {1, (uint32_t)(bytes / ps - 1), 0};   // version, last page, no bad pages
+    memcpy(page + 1024, info, sizeof info);
+    memcpy(page + 1024 + 12 + 16, "usmstandby", 10);         // after the (zero) UUID: the label
+    memcpy(page + ps - 10, "SWAPSPACE2", 10);
+    return pwrite(fd, page, (size_t)ps, 0) == ps ? 0 : -1;
+}
+
+#ifndef BTRFS_SUPER_MAGIC
+#define BTRFS_SUPER_MAGIC 0x9123683E
+#endif
+// The standby swap is filling up while it is needed: add one more file of the same size, if the disk
+// keeps 10% (at least 2 GiB) free after it. Controller thread only.
+static void sb_grow(void) {
+    static int told;
+    if (sb_n >= SB_FILES || now_us() < sb_retry_grow)
+        return;
+    sb_retry_grow = now_us() + 30e6;   // if this fails: not again right away
+    char dir[PATH_MAX], path[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", sb_paths[0]);
+    char *slash = strrchr(dir, '/');
+    if (!slash)
+        return;
+    *slash = 0;
+    struct statfs fs;
+    if (statfs(dir, &fs))
+        return;
+    long long free_b = (long long)fs.f_bavail * fs.f_bsize, total = (long long)fs.f_blocks * fs.f_bsize;
+    long long keep = total / 10 > (2LL << 30) ? total / 10 : (2LL << 30);
+    if (free_b - sb_step < keep) {
+        if (!told++)
+            printf("standby swap nearly full, and the disk has no room for more (%lld MiB free)\n", free_b >> 20);
+        return;
+    }
+    int len = (int)strlen(sb_paths[0]);
+    if (len > 5 && !strcmp(sb_paths[0] + len - 5, ".swap"))
+        len -= 5;
+    int fd = -1;
+    for (int i = sb_n + 1; fd < 0 && i < 100; i++) {
+        snprintf(path, sizeof path, "%.*s-%d.swap", len, sb_paths[0], i);
+        fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 && errno != EEXIST)
             break;
+    }
+    if (fd < 0) {
+        printf("standby swap: cannot add a file in %s: %s\n", dir, strerror(errno));
+        return;
+    }
+    if (fs.f_type == BTRFS_SUPER_MAGIC) {   // a swap file on btrfs: no copy-on-write
+        int fl = 0;
+        if (!ioctl(fd, FS_IOC_GETFLAGS, &fl)) {
+            fl |= FS_NOCOW_FL;
+            ioctl(fd, FS_IOC_SETFLAGS, &fl);
+        }
+    }
+    double t0 = now_us();
+    int bad = fallocate(fd, 0, 0, (off_t)sb_step) || write_swap_header(fd, sb_step) || fsync(fd);
+    int err = errno;
+    close(fd);
+    if (bad || sb_swapon(path)) {
+        printf("standby swap: cannot add %s: %s\n", path, strerror(bad ? err : errno));
+        unlink(path);
+        return;
+    }
+    pthread_mutex_lock(&sb_mx);
+    if (sb_state != SB_ON) {   // switched off meanwhile: not needed any more
+        pthread_mutex_unlock(&sb_mx);
+        swapoff(path);
+        unlink(path);
+        return;
+    }
+    snprintf(sb_paths[sb_n], PATH_MAX, "%s", path);
+    sb_n++;
+    sb_update_room();
+    pthread_mutex_unlock(&sb_mx);
+    sb_retry_grow = 0;
+    printf("standby swap nearly full: added %s (%lld MiB, %d files now, %.1f s)\n", path, sb_step >> 20, sb_n,
+           (now_us() - t0) / 1e6);
+}
+
+static void *sb_off_main(void *arg) {
+    long long used = (long long)(intptr_t)arg;
+    double t0 = now_us();
+    int r = 0, err = 0;
+    for (;;) {   // the files added first (newest first; they are deleted), the first one last
+        pthread_mutex_lock(&sb_mx);
+        int i = sb_n - 1;
+        pthread_mutex_unlock(&sb_mx);
+        if (swapoff(sb_paths[i])) {
+            r = -1;
+            err = errno;
+            break;
+        }
+        if (!i)
+            break;
+        pthread_mutex_lock(&sb_mx);
+        unlink(sb_paths[i]);
+        sb_n = i;
+        pthread_mutex_unlock(&sb_mx);
+    }
+    pthread_mutex_lock(&sb_mx);
+    __atomic_store_n(&sb_state, r ? SB_ON : SB_OFF, __ATOMIC_RELEASE);
+    if (r)
+        sb_retry_off = now_us() + 60e6;
+    __atomic_store_n(&sb_room_ok, 0, __ATOMIC_RELEASE);   // the controller checks again
+    pthread_cond_broadcast(&sb_cv);
+    pthread_mutex_unlock(&sb_mx);
+    if (r)
+        printf("standby swap stays on: %s\n", err == EINTR ? "RAM or VRAM got short again" : strerror(err));
+    else
+        printf("standby swap off: %lld MiB moved into RAM in %.1f s - new pages go to the VRAM again\n", used >> 10,
+               (now_us() - t0) / 1e6);
+    return NULL;
+}
+
+// The VRAM has room again: switch the standby swap off if its pages fit in RAM.
+static void sb_try_off(void) {
+    long long size = 0, used = 0, avail = meminfo_kib("MemAvailable:");
+    pthread_mutex_lock(&sb_mx);
+    if (sb_state == SB_ON && !sb_usage(&size, &used)) {   // someone else switched it off
+        __atomic_store_n(&sb_state, SB_OFF, __ATOMIC_RELEASE);
+        while (sb_n > 1)
+            unlink(sb_paths[--sb_n]);
+        printf("standby swap: %s was switched off from outside\n", sb_paths[0]);
+    } else if (sb_state == SB_ON && (avail < 0 || used + 2 * ram_low_kib() > avail)) {
+        sb_retry_off = now_us() + 5e6;   // its pages would not fit in RAM yet
+    } else if (sb_state == SB_ON) {
+        __atomic_store_n(&sb_state, SB_GOING_OFF, __ATOMIC_RELEASE);
+        __atomic_store_n(&sb_room_ok, 0, __ATOMIC_RELEASE);
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&sb_worker, &a, sb_off_main, (void *)(intptr_t)used)) {
+            __atomic_store_n(&sb_state, SB_ON, __ATOMIC_RELEASE);
+            sb_retry_off = now_us() + 60e6;
+        }
+        pthread_attr_destroy(&a);
+    }
+    pthread_mutex_unlock(&sb_mx);
+}
+
+static void *sb_main(void *arg) {
+    (void)arg;
+    // We never serve I/O here: our swapon / swapoff may free memory the normal way, with I/O.
+    prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
+    for (;;) {
+        pthread_mutex_lock(&sb_wake_mx);
+        if (!sb_wake && !sb_quit) {
+            struct timespec t;
+            timeout_in(&t, 200);
+            pthread_cond_timedwait(&sb_wake_cv, &sb_wake_mx, &t);
+        }
+        sb_wake = 0;
+        int quit = sb_quit;
+        pthread_mutex_unlock(&sb_wake_mx);
+        if (quit)
+            break;
+        size_t fr = cz_ratio ? free_count() : nr_chunks;
+        int in_file = __atomic_load_n(&spill_fd, __ATOMIC_RELAXED) >= 0;   // data in (or on its way to) the spill file
+        int full = cz_ratio && __atomic_load_n(&vram_held, __ATOMIC_RELAXED) && fr < sb_on_free;
+        int st = __atomic_load_n(&sb_state, __ATOMIC_ACQUIRE);
+        if (full || in_file) {
+            if (st != SB_ON)
+                standby_on(full ? "the VRAM is nearly full" : "data in the spill file");
+        } else if (st == SB_GOING_OFF) {
+            long long avail = meminfo_kib("MemAvailable:");
+            if (avail >= 0 && avail < ram_low_kib())
+                standby_on("RAM got short while its pages moved back");
+        } else if (st == SB_ON && fr >= sb_off_free && now_us() >= sb_retry_off) {
+            sb_try_off();
+        }
+        pthread_mutex_lock(&sb_mx);
+        long long room = sb_state == SB_ON ? sb_update_room() : -1;
+        pthread_mutex_unlock(&sb_mx);
+        // Needed (the device cannot take new pages now) and filling up: add a file before it is full.
+        long long low = sb_step / 4096 > 262144 ? sb_step / 4096 : 262144;   // KiB: 1/4 of a file, at least 256 MiB
+        if ((full || in_file) && room >= 0 && room < low)
+            sb_grow();
+    }
+    pthread_mutex_lock(&sb_mx);   // stopping: a swapoff under way is called off (usm-vramd-ctl decides)
+    while (sb_state == SB_GOING_OFF) {
+        pthread_kill(sb_worker, SIGURG);
+        struct timespec t;
+        timeout_in(&t, 50);
+        pthread_cond_timedwait(&sb_cv, &sb_mx, &t);
+    }
+    pthread_mutex_unlock(&sb_mx);
+    return NULL;
 }
 
 static int written(size_t c) {
@@ -984,12 +1293,17 @@ static int written(size_t c) {
 }
 
 // Move chunk c to the other place. Returns 1 = moved with a copy, 0 = moved without (never
-// written), -1 = copy or disk error (the chunk stays where it was).
+// written), -1 = copy or disk error (the chunk stays where it was), -2 = not now (it keeps being
+// written to, and the standby swap has no room: the queues must not wait for the disk).
 static int move_chunk(size_t c, int to_file, size_t *again) {
     int from = to_file ? C_VRAM : C_FILE, to = to_file ? C_FILE : C_VRAM;
     unsigned long long off = (unsigned long long)c * CHUNK;
     for (int tries = 0;; tries++) {
-        int last = tries >= 3;   // still being written to: hold the lock for the whole copy
+        // Still being written to: hold the lock for the whole copy. The queues then wait for the disk
+        // too, which is safe only while the standby swap has room.
+        int last = tries >= 3;
+        if (last && !__atomic_load_n(&sb_room_ok, __ATOMIC_ACQUIRE))
+            return -2;
         pthread_rwlock_wrlock(&move_lock);
         if (!written(c)) {
             chunk_state[c] = to;
@@ -1038,6 +1352,10 @@ static void spill(void) {
         printf("spill: nothing in VRAM\n");
         return;
     }
+    if (!standby_on("data moves to the spill file")) {
+        printf("spill failed: no standby swap to take new pages meanwhile (see STANDBY_MB) - the data stays in VRAM\n");
+        return;
+    }
     const char *how = "already open";
     if (spill_fd < 0) {
         if (!spill_path) {
@@ -1073,26 +1391,13 @@ static void spill(void) {
             }
         }
         spill_fd = fd;   // seen by the queues after the lock below, before any chunk moves there
-    } else if (nr_segs > nr_chunks) {   // compressed mode keeps the file open (overflow): reserve the VRAM part
-        how = "space reserved";
-        if (fallocate(spill_fd, 0, 0, (off_t)vram_bytes)) {
-            how = "space reserved for the current data only (disk too full for all of it)";
-            int ok = 1;
-            for (size_t c = 0; ok && c < nr_chunks; c++)
-                if (written(c))
-                    ok = !fallocate(spill_fd, 0, (off_t)c * CHUNK, CHUNK);
-            if (!ok) {
-                printf("spill failed: %s: cannot reserve %zu MiB: %s - the data stays in VRAM\n", spill_path,
-                       count_state(C_VRAM, 1) * (CHUNK >> 20), strerror(errno));
-                return;
-            }
-        }
+        standby_on("data moves to the spill file");   // stays on now that the file is open (the controller sees it)
     }
     printf("spill: copying %zu MiB from VRAM to %s (%s)\n", count_state(C_VRAM, 1) * (CHUNK >> 20), spill_path,
            how);
     size_t copied = 0, again = 0;
-    int failed = 0;
-    for (size_t c = 0; c < nr_chunks && !failed; c++) {
+    int failed = 0, busy = 0;
+    for (size_t c = 0; c < nr_chunks && !failed && !busy; c++) {
         if (chunk_state[c] != C_VRAM)
             continue;
         if (interrupted(M_SPILL))
@@ -1100,13 +1405,15 @@ static void spill(void) {
         if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))   // new pages keep coming meanwhile
             gc();
         int r = move_chunk(c, 1, &again);
-        failed = r < 0;
+        failed = r == -1;
+        busy = r == -2;
         copied += r > 0;
     }
     size_t left = count_state(C_VRAM, 1);
     if (count_state(C_VRAM, 0)) {
         printf("spill %s after %.1f s: %zu MiB still in VRAM, %zu MiB in %s - the device keeps working from both\n",
-               failed ? "failed (copy error)" : "stopped", (now_us() - t0) / 1e6, left * (CHUNK >> 20),
+               failed ? "failed (copy error)" : busy ? "stopped (busy chunk, standby swap full)" : "stopped",
+               (now_us() - t0) / 1e6, left * (CHUNK >> 20),
                count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
         return;
     }
@@ -1135,10 +1442,11 @@ static void fill(void) {
         }
         vram_held = 1;
     }
+    standby_on("data moves back from the spill file");   // should be on already (since the spill)
     printf("fill: copying %zu MiB from %s back to VRAM\n", count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
     size_t copied = 0, again = 0;
-    int failed = 0;
-    for (size_t c = 0; c < nr_chunks && !failed; c++) {
+    int failed = 0, busy = 0;
+    for (size_t c = 0; c < nr_chunks && !failed && !busy; c++) {
         if (chunk_state[c] != C_FILE)
             continue;
         if (interrupted(M_FILL))
@@ -1146,20 +1454,14 @@ static void fill(void) {
         if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))
             gc();
         int r = move_chunk(c, 0, &again);
-        failed = r < 0;
+        failed = r == -1;
+        busy = r == -2;
         copied += r > 0;
     }
     if (count_state(C_FILE, 0)) {
         printf("fill %s after %.1f s: %zu MiB still in %s - the device keeps working from both\n",
-               failed ? "failed (copy error)" : "stopped", (now_us() - t0) / 1e6,
-               count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
-        return;
-    }
-    if (nr_segs > nr_chunks) {   // the file stays for overflow; its VRAM part is not needed any more
-        fallocate(spill_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, (off_t)vram_bytes);
-        printf("filled: all data of /dev/ublkb%u that was spilled is back in VRAM (%zu MiB copied in %.1f s, %zu"
-               " chunk copies repeated); %s keeps only the overflow\n",
-               dev_id, copied * (CHUNK >> 20), (now_us() - t0) / 1e6, again, spill_path);
+               failed ? "failed (copy error)" : busy ? "stopped (busy chunk, standby swap full)" : "stopped",
+               (now_us() - t0) / 1e6, count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
         return;
     }
     pthread_rwlock_wrlock(&move_lock);   // nothing lives in the file any more
@@ -1212,7 +1514,7 @@ static void write_stats(int fd, struct queue *queues) {
         errors += queues[i].errors;
     }
     size_t in_vram = 0, on_disk = 0;   // MiB of segments / chunks in use, by place
-    for (size_t c = 0; c < nr_segs; c++) {
+    for (size_t c = 0; c < nr_chunks; c++) {
         int used = cz_ratio ? __atomic_load_n(&seg_open[c], __ATOMIC_RELAXED) != S_FREE : written(c);
         if (!used)
             continue;
@@ -1228,10 +1530,11 @@ static void write_stats(int fd, struct queue *queues) {
     int n = snprintf(buf, sizeof buf,
                      "device_mb=%zu vram_mb=%zu vram_held=%d compress=%.2f in_vram_mb=%zu on_disk_mb=%zu live_mb=%llu"
                      " pages=%llu zero=%llu raw=%llu comp=%llu comp_pct=%.0f refused=%llu reads=%llu writes=%llu"
-                     " errors=%llu\n",
+                     " errors=%llu standby=%s standby_files=%d standby_room=%d\n",
                      dev_bytes >> 20, vram_bytes >> 20, vram_held, cz_ratio, in_vram * (CHUNK >> 20),
                      on_disk * (CHUNK >> 20), live >> 20, pages, st_zero, st_raw, st_comp,
-                     st_comp ? 100.0 * st_comp_bytes / (st_comp * (double)PG) : 0.0, st_full, reads, writes, errors);
+                     st_comp ? 100.0 * st_comp_bytes / (st_comp * (double)PG) : 0.0, st_full, reads, writes, errors,
+                     sb_names[__atomic_load_n(&sb_state, __ATOMIC_RELAXED)], sb_n, __atomic_load_n(&sb_room_ok, __ATOMIC_RELAXED));
     if (n > 0 && pwrite(fd, buf, (size_t)n, 0) == n && ftruncate(fd, n))
         n = 0;
 }
@@ -1360,6 +1663,21 @@ int main(int argc, char **argv) {
     spill_path = getenv("USM_VRAMD_SPILL");
     if (spill_path && !*spill_path)
         spill_path = NULL;
+    const char *sb = getenv("USM_VRAMD_STANDBY"), *sbp = getenv("USM_VRAMD_STANDBY_PRIO");
+    if (sb && *sb) {
+        sb_prio = sbp ? atoi(sbp) : 0;
+        struct stat sbst;
+        if (sb_prio < 1 || sb_prio > 32767 || !realpath(sb, sb_paths[0]) || stat(sb_paths[0], &sbst) ||
+            sbst.st_size < (64 << 20)) {
+            fprintf(stderr, "standby swap %s (priority %s) not usable - without it, writes the VRAM has no room for"
+                            " are refused, and no spill\n", sb, sbp ? sbp : "not set");
+        } else {
+            sb_state = SB_OFF;
+            sb_step = (long long)sbst.st_size;
+            struct sigaction sa = {.sa_handler = on_sigurg};   // no SA_RESTART: interrupts its swapoff
+            sigaction(SIGURG, &sa, NULL);
+        }
+    }
     const char *cz = getenv("USM_VRAMD_COMPRESS");   // compressed mode: device = RATIO x VRAM
     if (cz && *cz) {
         cz_ratio = strtod(cz, NULL);
@@ -1421,38 +1739,18 @@ buffers:;
     // Per queue: I/O buffers; compressed mode also: read scratch, open segment, 2 pages for file reads.
     size_t io_part = (size_t)depth * IO_BUF;
     size_t per_queue = io_part + (cz_ratio ? io_part + CHUNK + 2 * PG : 0);
-    size_t buf_bytes = per_queue * nr_queues + CHUNK + (cz_ratio ? 2 * CHUNK : 0);   // + mover's stage, compactor's 2 segments
+    size_t buf_bytes = per_queue * nr_queues + CHUNK + (cz_ratio ? CHUNK : 0);   // + mover's stage, compactor's segment
     char *bufs = mmap(NULL, buf_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (bufs == MAP_FAILED) {
         perror("mmap (I/O buffers)");
         return 1;
     }
     stage = bufs + per_queue * nr_queues;
-    gdst[0].buf = cz_ratio ? stage + CHUNK : NULL;
-    gdst[1].buf = cz_ratio ? stage + 2 * CHUNK : NULL;
+    gdst.buf = cz_ratio ? stage + CHUNK : NULL;
     nr_chunks = vram_bytes / CHUNK;
-    // Compressed mode with a spill file: room for the whole device even if nothing compresses
-    // (+1/16 for the compactor's working space), the part beyond the VRAM in the file.
-    nr_segs = nr_chunks;
-    if (cz_ratio && spill_path) {
-        int fd = open(spill_path, O_RDWR | O_CREAT | O_EXCL | O_DIRECT | O_CLOEXEC, 0600);
-        size_t want = dev_bytes / CHUNK + dev_bytes / CHUNK / 16 + 8;
-        if (fd >= 0 && want > nr_chunks && !ftruncate(fd, (off_t)(want * CHUNK))) {
-            spill_fd = fd;
-            nr_segs = want;
-        } else {
-            fprintf(stderr, "overflow to %s not possible (%s): when the VRAM is full, writes are refused\n",
-                    spill_path, strerror(errno));
-            if (fd >= 0) {
-                close(fd);
-                unlink(spill_path);
-            }
-        }
-    }
-    over_next = nr_chunks;
-    chunk_state = calloc(nr_segs, 1);
-    chunk_dirty = calloc(nr_segs, 1);
-    chunk_written = calloc(nr_segs, 1);
+    chunk_state = calloc(nr_chunks, 1);
+    chunk_dirty = calloc(nr_chunks, 1);
+    chunk_written = calloc(nr_chunks, 1);
     if (!chunk_state || !chunk_dirty || !chunk_written) {
         fprintf(stderr, "out of memory\n");
         return 1;
@@ -1461,14 +1759,11 @@ buffers:;
         size_t pages = dev_bytes / PG;
         pmap = mmap(NULL, pages * sizeof *pmap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE,
                     -1, 0);
-        seg_live = calloc(nr_segs, sizeof *seg_live);
-        seg_open = calloc(nr_segs, sizeof *seg_open);
+        seg_live = calloc(nr_chunks, sizeof *seg_live);
+        seg_open = calloc(nr_chunks, sizeof *seg_open);
         free_segs = calloc(nr_chunks, sizeof *free_segs);
-        over_free = calloc(nr_segs - nr_chunks + 1, sizeof *over_free);
-        gdst[0].moves = calloc(CHUNK / 16, sizeof(struct gc_move));
-        gdst[1].moves = calloc(CHUNK / 16, sizeof(struct gc_move));
-        if (pmap == MAP_FAILED || !seg_live || !seg_open || !free_segs || !over_free || !gdst[0].moves ||
-            !gdst[1].moves) {
+        gdst.moves = calloc(CHUNK / 16, sizeof(struct gc_move));
+        if (pmap == MAP_FAILED || !seg_live || !seg_open || !free_segs || !gdst.moves) {
             fprintf(stderr, "out of memory (page map)\n");
             return 1;
         }
@@ -1476,13 +1771,19 @@ buffers:;
             seg_open[c] = S_FREE;
             free_segs[c] = (uint32_t)(nr_chunks - 1 - c);   // segment 0 is used first
         }
-        for (size_t c = nr_chunks; c < nr_segs; c++) {   // overflow: always in the file
-            seg_open[c] = S_FREE;
-            chunk_state[c] = C_FILE;
-        }
         free_n = nr_chunks;
-        gc_low = nr_chunks / 32 > 4 ? nr_chunks / 32 : 4;
-        gc_high = 2 * gc_low;
+        // Free segments: below sb_on_free (1/16 of the VRAM, at least 64 MiB) the standby swap goes on;
+        // the compactor starts at twice that (so dead space is reclaimed first) and stops at three
+        // times; at four times the standby may go off again. Never more than half the VRAM.
+        size_t half = nr_chunks / 2 > SEG_RESERVE + 2 ? nr_chunks / 2 : SEG_RESERVE + 2;
+#define AT_MOST_HALF(x) ((x) < half ? (x) : half)
+        sb_on_free = AT_MOST_HALF(nr_chunks / 16 > 64 ? nr_chunks / 16 : 64);
+        if (sb_on_free > nr_chunks / 4 && nr_chunks / 4 > SEG_RESERVE + 2)
+            sb_on_free = nr_chunks / 4;
+        gc_low = AT_MOST_HALF(2 * sb_on_free);
+        gc_high = AT_MOST_HALF(3 * sb_on_free);
+        sb_off_free = AT_MOST_HALF(4 * sb_on_free);
+#undef AT_MOST_HALF
     }
     pthread_rwlockattr_t rwa;   // the mover's short steps must not wait behind a stream of batches
     pthread_rwlockattr_init(&rwa);
@@ -1518,8 +1819,8 @@ buffers:;
 
     struct queue *queues = calloc(nr_queues, sizeof(*queues));
     all_queues = queues;
-    int started = 0, mover_started = 0;
-    pthread_t mover;
+    int started = 0, mover_started = 0, sb_started = 0;
+    pthread_t mover, sb_thread;
     struct ublk_params p = {
         .len = sizeof(p),
         .types = UBLK_PARAM_TYPE_BASIC,
@@ -1575,6 +1876,7 @@ buffers:;
     }
     int setup_failed = started < nr_queues;
     mover_started = !pthread_create(&mover, NULL, mover_main, NULL);
+    sb_started = sb_state != SB_NONE && !pthread_create(&sb_thread, NULL, sb_main, NULL);
     pthread_mutex_lock(&ready_lock);
     while (queues_ready < started || (mover_started && !mover_state))
         pthread_cond_wait(&ready_cond, &ready_lock);
@@ -1604,9 +1906,10 @@ buffers:;
         char czs[96] = "";
         if (cz_ratio)
             snprintf(czs, sizeof czs, ", compressed (lz4) into %zu MiB", vram_bytes >> 20);
-        printf("ready: /dev/ublkb%u = %zu MiB of %s%s (%d queues x depth %d, poll %d us; spill file: %s)\n", dev_id,
-               dev_bytes >> 20, fake_mem ? "TEST device memory (RTX 3050 copy times)" : "VRAM", czs, nr_queues,
-               depth, poll_us, spill_path ? spill_path : "none");
+        printf("ready: /dev/ublkb%u = %zu MiB of %s%s (%d queues x depth %d, poll %d us; spill file: %s;"
+               " standby swap: %s)\n", dev_id, dev_bytes >> 20,
+               fake_mem ? "TEST device memory (RTX 3050 copy times)" : "VRAM", czs, nr_queues, depth, poll_us,
+               spill_path ? spill_path : "none", sb_state != SB_NONE ? sb_paths[0] : "none");
         const char *sp = getenv("USM_VRAMD_STATS");   // a one-line status file, rewritten every 5 s
         int stats_fd = sp && *sp ? open(sp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
         for (;;) {
@@ -1631,6 +1934,13 @@ buffers:;
             fprintf(stderr, "stopping /dev/ublkb%u: %s\n", dev_id, strerror(-ret));
     }
 out:
+    if (sb_started) {
+        pthread_mutex_lock(&sb_wake_mx);
+        sb_quit = 1;
+        pthread_cond_signal(&sb_wake_cv);
+        pthread_mutex_unlock(&sb_wake_mx);
+        pthread_join(sb_thread, NULL);
+    }
     if (mover_started && mover_state == 1) {
         tell_mover(M_QUIT);
         pthread_join(mover, NULL);
@@ -1671,20 +1981,24 @@ out:
                (reads + writes) ? busy_us / (reads + writes) : 0.0, per_q, minflt, majflt, file_reads, file_writes);
     if (cz_ratio) {
         unsigned long long live = 0;
-        size_t used = 0, over = 0;
-        for (size_t c = 0; c < nr_segs; c++) {
+        size_t used = 0;
+        for (size_t c = 0; c < nr_chunks; c++) {
             live += seg_live[c];
-            used += seg_open[c] != S_FREE && c < nr_chunks;
-            over += seg_open[c] != S_FREE && c >= nr_chunks;
+            used += seg_open[c] != S_FREE;
         }
         unsigned long long stored = st_zero + st_raw + st_comp;
         printf("compressed: %llu pages written (%llu all-zero, %llu kept raw, %llu compressed to %.0f%% on average);"
-               " now %llu MiB live in %zu of %zu MiB of VRAM segments + %zu MiB of overflow segments on disk (%zu MiB"
-               " reserved); %llu pages discarded; compactor: %llu rounds, %llu MiB moved; %llu writes refused (full)\n",
+               " now %llu MiB live in %zu of %zu MiB of segments; %llu pages discarded; compactor: %llu rounds,"
+               " %llu MiB moved\n",
                stored, st_zero, st_raw, st_comp, st_comp ? 100.0 * st_comp_bytes / (st_comp * (double)PG) : 0.0,
-               live >> 20, used * (CHUNK >> 20), nr_chunks * (CHUNK >> 20), over * (CHUNK >> 20),
-               (over_next - nr_chunks) * (CHUNK >> 20), st_discard, st_gc_runs, st_gc_bytes >> 20, st_full);
+               live >> 20, used * (CHUNK >> 20), nr_chunks * (CHUNK >> 20), st_discard, st_gc_runs,
+               st_gc_bytes >> 20);
     }
+    if (st_full)
+        printf("writes refused: %llu (no room in the VRAM, or the disk was not safe to use then)\n", st_full);
+    if (sb_state == SB_ON)
+        printf("standby swap still on: %s%s (usm-vramd-ctl switches it off once its pages fit in RAM)\n",
+               sb_paths[0], sb_n > 1 ? " and the files added" : "");
     ctrl_cmd(UBLK_U_CMD_STOP_DEV, dev_id, NULL, 0, 0);
     // The device goes away once nothing holds its character device open any more.
     for (int i = 0; i < started; i++) {

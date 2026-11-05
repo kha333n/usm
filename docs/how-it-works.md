@@ -41,16 +41,37 @@ A map in RAM (8 bytes per page) says where each page lives.
 When pages are rewritten, or swap no longer needs them, they leave dead space. The kernel tells the daemon about
 those pages through discard. A mover thread compacts mostly-dead segments in the background.
 
-With `COMPRESS=3` the device is 3× the VRAM. If the VRAM fills with data that doesn't compress, new segments go to an
-overflow file in `SPILL_DIR` instead. The file's space is reserved ahead, so serving never waits on the file system.
-So the device can always hold its full size.
+With `COMPRESS=3` the device is 3× the VRAM. If the VRAM fills up anyway (data that doesn't compress well), the
+**standby swap** takes over (below).
+
+### The standby swap (`STANDBY_MB`)
+
+The daemon never waits for the disk while it serves swap. That matters because of how Linux behaves when memory
+has run out:
+- Writing a file needs a little kernel memory.
+- When memory is gone, that memory only comes back once swap writes finish.
+- If all of those writes are waiting for the daemon, and the daemon waits for the disk, nothing ever finishes and
+  the whole machine hangs. Version 0.1.0-beta.1 could do exactly that: its compressed mode wrote the part that didn't
+  fit in VRAM to a file itself.
+
+So since 0.1.0-beta.2 there is a standby swap: an ordinary swap file in `SPILL_DIR` (by default as big as the VRAM
+tier, at most 4 GiB). The daemon switches it on **above** its own device whenever the VRAM is nearly full, or data
+is in the spill file (below). Linux then writes new pages to the disk with its own swap code, which is built to work
+with no free memory, and the room left in VRAM takes rewrites of pages already there. If the standby fills up while
+it is needed, the daemon adds another file of the same size, as long as the disk keeps 10% (at least 2 GiB) free.
+Once the VRAM has room again and the standby's pages fit in RAM, the daemon switches it off (the pages move into RAM,
+the added files are deleted) and new pages go to VRAM again.
+
+If there is no standby swap (`STANDBY_MB=0`, or no disk space), a full VRAM refuses writes: Linux keeps those pages
+in RAM. And switching off with RAM full is refused too.
 
 ### Switching off: swapoff or spill
 
 `usm off` gives the VRAM back:
 - **RAM has room:** the pages move into RAM (`swapoff`). The move is watched and interrupted if RAM gets low.
 - **RAM is full:** the daemon **spills** instead. It copies its data chunk by chunk (1 MiB) straight from VRAM to a
-  file on disk, never through RAM, and the device keeps serving the whole time. Then it frees the VRAM.
+  file on disk, never through RAM, and the device keeps serving the whole time. Then it frees the VRAM. The standby
+  swap is on for all of this, so the kernel never depends on the daemon's disk I/O to free memory.
 
 After a spill, a background job (`usm-vramd-drain`) moves the pages into RAM once RAM has room, then stops the
 daemon. `usm on` during that time copies the data back into VRAM (**fill**).
@@ -67,6 +88,7 @@ tested with suspend on real GPUs, and with hibernation in a VM (kernel test mode
 
 - It is **never picked by the OOM killer** (`oom_score_adj -1000`), and all its memory is **locked** (`mlockall`).
 - Its own memory allocations never start I/O (`PR_SET_IO_FLUSHER`), so it never waits on its own swap device.
+- It never waits for the disk while the kernel depends on it to free memory (the standby swap, above).
 - It pre-touches everything it needs before the device goes live: **0 page faults** while serving, measured.
 - It **refuses to stop while its device is in use** (ublk `TRY_STOP_DEV`). Swap must be off first.
 - It keeps the GPU out of runtime sleep while on. This avoids a wake-up delay on every swap-in and avoids sleep/wake
@@ -132,7 +154,7 @@ sampling. `usm report` and `usm dash` read these files.
 | `/etc/usm/usm.conf` | settings (`usm config`) |
 | `/etc/systemd/system/usm-{vram,guard,logger}.service` | the services; `usm-vramd-{sleep,wake}.service` + drop-ins for sleep |
 | `/var/log/usm/` | logs |
-| `/var/lib/usm-swap/` | overflow / spill file (only while needed) |
+| `/var/lib/usm-swap/` | standby swap file, spill file (only while needed) |
 | `/usr/local/share/gnome-shell/extensions/usm-desktop@usm/` | GNOME extension |
 | `/usr/share/polkit-1/actions/org.usm.switch.policy` | lets the desktop menu switch USM without a password |
 | `/run/usm-*` | runtime state (gone at reboot) |

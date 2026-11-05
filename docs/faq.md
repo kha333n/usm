@@ -58,6 +58,7 @@ The **Quick Settings toggle** does the same with one click. Automatic switching 
 **Nothing bad.** The data doesn't have to fit into RAM:
 
 1. The daemon copies it **straight from VRAM to a file on disk** (`/var/lib/usm-swap`); swapping keeps working.
+   Meanwhile, new pages go to the standby swap file there.
 2. The VRAM is released.
 3. Later, once RAM has room, the data moves into RAM by itself.
 
@@ -166,7 +167,7 @@ The tier is switched off first, your zswap and readahead settings are restored, 
 | NVIDIA only, first GPU only | Other GPUs get the guard and logger, not the tier |
 | Daemon crash or GPU reset | The data in VRAM is lost, and those apps crash |
 | Guard needs GNOME 45–50 | Elsewhere it only watches and logs |
-| Capacity = VRAM (×3 with compression) | Beyond that your disk swap takes over, so keep one |
+| Capacity = VRAM (×3 with compression) | Beyond that, USM's standby swap file on the disk takes over (`STANDBY_MB`, it grows while needed and the disk has room) |
 | The disk itself is the bottleneck | A big download or update hammering a slow SSD: USM can't help, and the guard stays out of the way |
 | Hibernation on real hardware | Not tested with a real power-off yet (suspend is, and hibernation in a VM) |
 

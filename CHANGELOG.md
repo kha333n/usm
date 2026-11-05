@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.0-beta.2] - 2026-11-05
+
+Fixes a hang. Please update if you run 0.1.0-beta.1.
+
+- **Fixed: the whole system could hang under heavy memory pressure** once the VRAM was full in compressed mode
+  (the default). The daemon wrote the data that didn't fit in VRAM to a file itself, while it was serving swap.
+  When memory had run out, that file write waited for memory that only finishing swap writes could free, and those
+  writes waited for the daemon. Found in a release test: a 2 GiB VM froze within seconds, every time.
+- **New: the standby swap** (`STANDBY_MB`, default `auto`: as big as the VRAM tier, at most 4 GiB). An ordinary swap
+  file in `SPILL_DIR` that the daemon switches on above its own device while the VRAM is nearly full, or while data
+  is in the spill file. Linux then writes new pages to the disk itself. When it fills up while needed, more files of
+  the same size are added (the disk keeps 10%, at least 2 GiB, free). It switches off again once the VRAM has room
+  and its pages fit in RAM. The daemon no longer touches the disk while the kernel depends on it to free memory.
+- The compressed overflow file is gone. Without a standby swap (`STANDBY_MB=0`), a full VRAM refuses writes (Linux
+  keeps those pages in RAM), and `usm off` with RAM full is refused.
+- The compactor starts earlier (below 1/8 of the VRAM free), so dead space is reclaimed before the standby swap is
+  needed.
+- `usm status` shows the standby swap when it is on.
+
 ## [0.1.0-beta.1] - 2026-11-05
 
 First public beta. Tested on Ubuntu 26.04 (kernel 7.0) with an RTX 3050 6 GB and an RTX 4060 8 GB laptop GPU.

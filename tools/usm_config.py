@@ -119,11 +119,19 @@ SETTINGS = [
       "games, AI or other GPU-heavy apps: usm off (usm on afterwards)."),
     S("COMPRESS", "3", integer(0, 8), "tier",
       "0 = store pages as they are. 2..8 = compress them (lz4, on the CPU, ~1 us per page): the swap device is "
-      "COMPRESS x VRAM_MB big. Typical app memory shrinks to about a third, so 3 fills the VRAM well; what does "
-      "not fit (data that does not compress) overflows into a file in SPILL_DIR. Needs liblz4."),
+      "COMPRESS x VRAM_MB big. Typical app memory shrinks to about a third, so 3 fills the VRAM well. When the "
+      "VRAM is nearly full (data that does not compress well), new pages go to the standby swap (STANDBY_MB). "
+      "Needs liblz4."),
     S("SPILL_DIR", "/var/lib/usm-swap", path(), "tier",
-      "A directory on a disk (not tmpfs). Used for the compressed overflow and when the tier is switched off "
-      "while RAM is full (the data then moves from VRAM to a file here, never through RAM)."),
+      "A directory on a disk (not tmpfs). Holds the standby swap file, and the data when the tier is switched "
+      "off while RAM is full (it then moves from VRAM to a file here, never through RAM)."),
+    S("STANDBY_MB", "auto", integer(256, 1 << 20, "auto", "0"), "tier",
+      "Size of the standby swap: a swap file in SPILL_DIR that Linux uses before the VRAM while the VRAM is "
+      "nearly full or its data is on disk (switching off with RAM full). It keeps the daemon itself from ever "
+      "waiting on the disk while it serves swap. auto = as big as the VRAM tier, at most 4096, smaller if the "
+      "disk is short of space. When it fills up while needed, more files of this size are added (as long as the "
+      "disk keeps 10% free, at least 2 GiB); they go again when it switches off. 0 = none: then a full VRAM "
+      "refuses writes (Linux keeps those pages in RAM) and switching off needs room in RAM."),
     S("ZSWAP_POOL_WITH_TIER", "10", integer(0, 100, "keep"), "tier",
       "zswap (compressed swap cache in RAM) while the tier is on: a pool of this % of RAM; restored when the "
       "tier goes off. 0 = zswap off while on. keep = do not touch zswap. 10 keeps a small fast cache in RAM and "
