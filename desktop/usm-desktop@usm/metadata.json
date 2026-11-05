@@ -1,0 +1,7 @@
+{
+  "uuid": "usm-desktop@usm",
+  "name": "USM desktop helper",
+  "description": "For USM, the memory-overload guard: reports which app is in front (so the guard never pauses it and lets a paused app run again the moment you switch to it), how long you have been idle, and how late GNOME Shell itself runs (desktop lag) for USM's logs. Writes only $XDG_RUNTIME_DIR/usm-desktop. No window titles. Adds USM to Quick Settings: VRAM swap tier and guard switches, status, mark a slow moment, live view.",
+  "version": 2,
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
+}

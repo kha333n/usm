@@ -1,0 +1,19 @@
+#!/bin/bash
+# Called by usm-guard.service with the settings of /etc/usm/usm.conf in the environment.
+HERE=$(cd "$(dirname "$0")" && pwd)
+case "$1" in
+start)
+  exec /usr/bin/python3 "$HERE/usm-guard.py" --desktop --mode "${GUARD_MODE:-full}" --exclude "${GUARD_EXCLUDE:-}" \
+    --min-app-mb "${GUARD_MIN_APP_MB:-256}" --protect-desktop "${GUARD_PROTECT_MB:-1024}M" \
+    --high-ticks "${GUARD_HIGH_TICKS:-0}" --trigger "${GUARD_TRIGGER:-0}" --pause-max "${GUARD_PAUSE_MAX_S:-20}" \
+    --cooldown "${GUARD_COOLDOWN_S:-120}" --recent "${GUARD_RECENT_S:-300}" --swap-dir "${SPILL_DIR:-/var/lib/usm-swap}" \
+    --log-dir "${LOG_DIR:-/var/log/usm}" --keep-days "${LOG_KEEP_DAYS:-30}" --max-mb "${LOG_MAX_MB:-300}" ;;
+thaw)   # after the guard stopped - also after a crash: no app may stay paused
+  for f in /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/app.slice/*/cgroup.freeze; do
+    [ "$(cat "$f" 2>/dev/null)" = 1 ] && echo 0 > "$f"
+  done
+  for f in /sys/fs/cgroup/user.slice/user-*.slice/user@*.service/app.slice/*/memory.zswap.max; do
+    [ "$(cat "$f" 2>/dev/null)" = 0 ] && echo max > "$f"
+  done
+  exit 0 ;;
+esac

@@ -1,0 +1,331 @@
+#!/bin/bash
+# usm-vramd-ctl: switch the VRAM swap tier (user-space program version) on or off.
+#
+#   usm-vramd-ctl on [VRAM_MB=4096] [POLL_US=0]      (env USM_VRAM_QUEUES=4, USM_VRAM_COMPRESS=RATIO)
+#        USM_VRAM_COMPRESS=2: compressed mode, the swap device is 2x the VRAM it uses (lz4 on the CPU);
+#        what does not fit in the VRAM (data that does not compress) overflows into the spill file
+#        start usm-vramd (borrows VRAM through CUDA) and make its device the top-priority swap.
+#        If an earlier "off" left the data in the spill file: copy it back into VRAM instead.
+#   usm-vramd-ctl off
+#        give the VRAM back:
+#        - RAM has room for the pages: swapoff (they move into RAM), stop the program;
+#        - otherwise spill: the program copies its data from VRAM straight to a file on disk
+#          ($USM_VRAM_SPILL_DIR, default /var/lib/usm-swap) and releases the VRAM. The device stays a
+#          swap device, now on disk; a background job (unit usm-vramd-drain) empties it into RAM
+#          once RAM has room, then stops the program and deletes the file.
+#        env USM_VRAM_OFF=auto (default) | swapoff (one plain swapoff, for comparison) | spill
+#   usm-vramd-ctl drain      (the background job) empty a spilled device if RAM has room now
+#   usm-vramd-ctl sleep|wake (run by systemd around suspend/hibernate, see install_hooks)
+#   usm-vramd-ctl hooks-install|hooks-remove DIR   the sleep/wake units for good (an installation: /etc/systemd/system)
+#   usm-vramd-ctl status
+#
+# Needs: NVIDIA GPU + driver (libcuda.so.1), stock kernel with ublk_drv. Run as root.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+UNIT=usm-vramd
+DRAIN=usm-vramd-drain
+PRIO=${USM_VRAM_PRIO:-200}           # above zram (100): the kernel fills VRAM first
+MARK=/run/usm-vramd.loaded-ublk      # we loaded ublk_drv, so "off" unloads it again
+INV=/run/usm-vramd.invocation        # systemd invocation id of the running daemon
+PM=/run/usm-vramd.gpu-power          # the GPU's runtime power setting before "on"
+SPILL_DIR=${USM_VRAM_SPILL_DIR:-/var/lib/usm-swap}
+SPILL=$SPILL_DIR/vram-spill
+ARGS=/run/usm-vramd.args             # how "on" was called (VRAM_MB POLL QUEUES COMPRESS SPILL_DIR [test memory])
+SLEEP_ARGS=/run/usm-vramd.sleep-args # the tier was on when the machine went to sleep
+SD=${USM_VRAM_HOOK_DIR:-/run/systemd/system}   # runtime units: gone at reboot, like the tier itself
+STATS=/run/usm-vramd.stats           # the program's status line (every 5 s)
+DEVF=/run/usm-vramd.dev              # its device, readable without root (the journal is not)
+
+# The NVIDIA GPU's PCI device. While the program runs, the GPU must not power itself down
+# (runtime D3): swapped data lives in its memory and every swap-in would first wait for it
+# to wake up. Costs some idle power (battery) while on.
+gpu_pci() {
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(cat "$d/vendor")" = 0x10de ] || continue
+    case "$(cat "$d/class")" in 0x0300*|0x0302*) echo "$d"; return;; esac
+  done
+}
+
+log() { [ -s $INV ] && journalctl -q _SYSTEMD_INVOCATION_ID="$(cat $INV)" -o cat; }
+device() {
+  if [ -s $DEVF ] && systemctl is-active -q $UNIT; then cat $DEVF; return; fi
+  log | sed -n 's|^ready: \(/dev/ublkb[0-9]*\) .*|\1|p' | tail -1 || true   # none: not running
+}
+# The program's last word on moving data between VRAM and the spill file.
+last_move() { log | grep -E '^(spill|fill|spilled|filled)(:| failed| stopped)' | tail -1 || true; }
+spilled() {
+  local m; m=$(last_move)
+  # The journal may have been trimmed since the last move: then the program's status line tells.
+  if [ -z "$m" ] && [ -s $STATS ]; then grep -q 'vram_held=0' $STATS; return; fi
+  case "$m" in spilled:*|"spill: nothing"*) return 0;; *) return 1;; esac
+}
+in_swap() { [ -n "$1" ] && grep -q "^$1 " /proc/swaps; }
+used_mib() { awk -v d="$1" '$1 == d {print int($4 / 1024)}' /proc/swaps; }
+
+# Send a request to the program and wait for its answer (a spill or fill takes seconds to minutes).
+ask() {   # ask SIGNAL ANSWER_REGEX
+  local before ans
+  before=$(log | wc -l)
+  systemctl kill -s "$1" --kill-whom=main $UNIT
+  for _ in $(seq 7200); do   # up to 1 hour
+    ans=$(log | tail -n +$((before + 1)) | grep -E "$2" | tail -1 || true)
+    if [ -n "$ans" ]; then echo "$ans"; return 0; fi
+    systemctl is-active -q $UNIT || { echo "usm-vramd stopped"; return 1; }
+    sleep 0.5
+  done
+  echo "no answer from usm-vramd"; return 1
+}
+
+start_drain() {
+  systemctl is-active -q $DRAIN && return 0
+  systemctl reset-failed $DRAIN > /dev/null 2>&1 || true
+  systemd-run -q --unit=$DRAIN --collect -p DefaultDependencies=no \
+    /bin/sh -c "while ! '$HERE/usm-vramd-ctl' drain; do sleep ${USM_VRAM_DRAIN_EVERY:-30}; done"
+}
+
+# Sleep: before suspend/hibernate Linux freezes every program, usm-vramd too; any swap I/O to its
+# device after that would never finish (hibernation frees memory by swapping, after the freeze),
+# and NVIDIA's own suspend step would have to save the tier's VRAM. So the tier goes fully off
+# before any sleep (pages into RAM / the disk swap) and comes back after; if it cannot be emptied,
+# the sleep is refused (sleep.target requires the hook) rather than risking a hang.
+install_hooks() {
+  [ -n "${USM_VRAM_NO_SLEEP_HOOK:-}" ] && return 0
+  # Installed for good already (install.sh): nothing to add at run time.
+  [ "$SD" != /etc/systemd/system ] && [ -e /etc/systemd/system/usm-vramd-sleep.service ] && return 0
+  [ -e $SD/usm-vramd-sleep.service ] && return 0
+  mkdir -p $SD
+  cat > $SD/usm-vramd-sleep.service <<EOF
+[Unit]
+Description=USM: switch the VRAM swap tier off before the machine sleeps
+DefaultDependencies=no
+Before=sleep.target nvidia-suspend.service nvidia-hibernate.service nvidia-suspend-then-hibernate.service
+[Service]
+Type=oneshot
+ExecStart=$HERE/usm-vramd-ctl sleep
+TimeoutStartSec=15min
+EOF
+  cat > $SD/usm-vramd-wake.service <<EOF
+[Unit]
+Description=USM: switch the VRAM swap tier back on after sleep
+DefaultDependencies=no
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target nvidia-resume.service
+[Service]
+Type=oneshot
+ExecStart=$HERE/usm-vramd-ctl wake
+EOF
+  mkdir -p $SD/sleep.target.d
+  printf '[Unit]\nRequires=usm-vramd-sleep.service\nAfter=usm-vramd-sleep.service\n' > $SD/sleep.target.d/usm-vramd.conf
+  for t in suspend hibernate hybrid-sleep suspend-then-hibernate; do
+    mkdir -p $SD/$t.target.d
+    printf '[Unit]\nWants=usm-vramd-wake.service\n' > $SD/$t.target.d/usm-vramd.conf
+  done
+  systemctl daemon-reload
+}
+
+uninstall_hooks() {
+  [ -e $SD/usm-vramd-sleep.service ] || return 0
+  rm -f $SD/usm-vramd-sleep.service $SD/usm-vramd-wake.service
+  for t in sleep suspend hibernate hybrid-sleep suspend-then-hibernate; do
+    rm -f $SD/$t.target.d/usm-vramd.conf
+    rmdir $SD/$t.target.d 2>/dev/null || true
+  done
+  systemctl daemon-reload
+}
+
+# The device is no longer swap: stop the program and undo everything "on" did.
+full_stop() {
+  if systemctl is-active -q $UNIT; then
+    systemctl stop $UNIT   # usm-vramd itself refuses to stop while its device is still in use
+    log | grep -E '^(stopped|compressed):' || true
+  fi
+  rm -f $INV
+  [ -n "${IN_DRAIN:-}" ] || systemctl stop $DRAIN > /dev/null 2>&1 || true
+  if [ -e $MARK ]; then   # the deleted device may hold the module for a moment
+    for _ in $(seq 25); do rmmod ublk_drv 2>/dev/null && break; sleep 0.2; done
+    if lsmod | grep -q '^ublk_drv '; then echo "warning: ublk_drv still loaded" >&2; else rm -f $MARK; fi
+  fi
+  gpu=$(gpu_pci)
+  if [ -e $PM ]; then
+    [ -n "$gpu" ] && cat $PM > "$gpu/power/control"
+    rm -f $PM
+  fi
+  rm -f $ARGS $STATS $DEVF
+  [ -n "${IN_SLEEP:-}" ] || uninstall_hooks
+  echo "VRAM swap off (VRAM released)"
+}
+
+# One change at a time: on / off / drain wait for each other (e.g. "off" while the background
+# drain is in the middle of its swapoff; two swapoffs of one device fail).
+case "${1:-status}" in
+on|off|drain|sleep|wake) exec 9> /run/usm-vramd.lock; flock 9 ;;
+esac
+
+case "${1:-status}" in
+on)
+  if systemctl is-active -q $UNIT; then
+    dev=$(device)
+    systemctl stop $DRAIN > /dev/null 2>&1 || true
+    ans=$(ask USR2 '^(filled:|fill failed|fill stopped|fill: nothing)') || true
+    case "$ans" in
+      "fill: nothing"*) echo "already on: $dev" ;;
+      filled:*) echo "$ans"; echo "VRAM swap on again: $dev" ;;
+      *) echo "$ans" >&2; echo "the data stays (partly) in $SPILL; the device keeps working" >&2
+         spilled && start_drain; exit 1 ;;
+    esac
+    exit 0
+  fi
+  if ! lsmod | grep -q '^ublk_drv '; then modprobe ublk_drv; touch $MARK; fi
+  # Leftovers of an earlier run (no program is running, so nothing uses them).
+  mkdir -p "$SPILL_DIR"; chmod 700 "$SPILL_DIR"
+  rm -f "$SPILL"
+  if [ "$(stat -f -c %T "$SPILL_DIR")" = tmpfs ]; then
+    echo "warning: $SPILL_DIR is in RAM (tmpfs) - a spill there would not free any RAM" >&2
+  fi
+  for f in /var/lib/usm-swap/evac-*; do   # temporary swap files of the older mover
+    [ -e "$f" ] || continue
+    u=$(awk -v f="$f" '$1 == f {print $4}' /proc/swaps)
+    if [ -z "$u" ]; then rm -f "$f"; elif [ "$u" -lt 1024 ]; then swapoff "$f" && rm -f "$f"; fi
+  done
+  # VRAM must be the first swap, above anything else.
+  top=$(awk 'NR > 1 && $5 > m {m = $5} END {print m + 0}' /proc/swaps)
+  [ "$PRIO" -le "$top" ] && PRIO=$(( top + 100 > 32767 ? 32767 : top + 100 ))
+  # Test mode (no GPU): device memory from a PCI BAR, e.g. QEMU ivshmem in the test VM.
+  if [ -n "${USM_VRAMD_FAKE:-}" ]; then echo 1 > "$(dirname "$USM_VRAMD_FAKE")/enable"; fi
+  gpu=$(gpu_pci)
+  if [ -n "$gpu" ] && [ ! -e $PM ]; then
+    cat "$gpu/power/control" > $PM
+    echo on > "$gpu/power/control"
+  fi
+  # DefaultDependencies=no: starting it does not pull in boot targets (that would re-enable
+  # swaps the user turned off, e.g. zram), and at shutdown swap is turned off while it still runs.
+  systemd-run -q --unit=$UNIT --collect -p DefaultDependencies=no -p OOMScoreAdjust=-1000 \
+    ${USM_VRAMD_FAKE:+-E USM_VRAMD_FAKE=$USM_VRAMD_FAKE} -E USM_VRAMD_SPILL="$SPILL" \
+    ${USM_VRAM_COMPRESS:+-E USM_VRAMD_COMPRESS=$USM_VRAM_COMPRESS} -E USM_VRAMD_STATS=$STATS \
+    "$HERE/usm-vramd" "${2:-4096}" "${USM_VRAM_QUEUES:-4}" 32 "${3:-0}"
+  systemctl show -p InvocationID --value $UNIT > $INV
+  dev=
+  for _ in $(seq 150); do
+    dev=$(device); [ -n "$dev" ] && break
+    systemctl is-active -q $UNIT || break
+    sleep 0.1
+  done
+  if [ -z "$dev" ]; then echo "usm-vramd did not start:" >&2; log >&2; exit 1; fi
+  echo "$dev" > $DEVF
+  # Send real I/O through every queue once (reads and writes, small and large) before it becomes
+  # swap: anything the program sets up on first use happens now, while memory is still free.
+  for q in /sys/block/"${dev#/dev/}"/mq/*/; do
+    cpu=$(cut -d, -f1 "$q/cpu_list" | cut -d- -f1)
+    for bs in 4k 256k; do
+      taskset -c "$cpu" dd if=/dev/zero of="$dev" bs=$bs count=64 oflag=direct status=none
+      taskset -c "$cpu" dd if="$dev" of=/dev/null bs=$bs count=64 iflag=direct status=none
+    done
+  done
+  mkswap -L usmvram "$dev" > /dev/null
+  # Compressed mode: swap tells the program which pages it no longer needs (their space is reused).
+  swapon -p "$PRIO" ${USM_VRAM_COMPRESS:+--discard=pages} "$dev"
+  echo "${2:-4096} ${3:-0} ${USM_VRAM_QUEUES:-4} ${USM_VRAM_COMPRESS:-0} $SPILL_DIR ${USM_VRAMD_FAKE:-}" > $ARGS
+  install_hooks
+  echo "VRAM swap on: $dev, $(( $(blockdev --getsize64 "$dev") >> 20 )) MiB at priority $PRIO"
+  ;;
+off)
+  dev=$(device)
+  if in_swap "$dev"; then
+    mode=${USM_VRAM_OFF:-auto}
+    [ -n "${USM_VRAM_PLAIN_OFF:-}" ] && mode=swapoff
+    if spilled; then   # the VRAM is already free; the data waits on disk for room in RAM
+      if ! "$HERE/usm-vram-move.py" "$dev"; then
+        echo "VRAM already released; $(used_mib "$dev") MiB stay in $SPILL until RAM has room ($DRAIN)"
+        start_drain; exit 0
+      fi
+    else
+      case $mode in
+      swapoff)
+        echo "moving with plain swapoff"
+        swapoff "$dev" || { echo "VRAM swap stays on" >&2; exit 1; } ;;
+      auto|spill)
+        rc=3
+        if [ "$mode" = auto ]; then "$HERE/usm-vram-move.py" "$dev" && rc=0 || rc=$?; fi
+        if [ "$rc" = 3 ]; then
+          ans=$(ask USR1 '^(spilled:|spill failed|spill stopped|spill: nothing)') || true
+          echo "$ans"
+          case "$ans" in
+            spilled:*|"spill: nothing"*)
+              start_drain
+              echo "VRAM released; $(used_mib "$dev") MiB of swap now in $SPILL, moved into RAM once it has room ($DRAIN)"
+              exit 0 ;;
+            *) echo "VRAM swap stays on" >&2; exit 1 ;;
+          esac
+        elif [ "$rc" != 0 ]; then
+          echo "VRAM swap stays on" >&2; exit 1
+        fi ;;
+      *) echo "USM_VRAM_OFF: auto, swapoff or spill" >&2; exit 2 ;;
+      esac
+    fi
+  fi
+  full_stop
+  ;;
+drain)
+  dev=$(device)
+  systemctl is-active -q $UNIT || exit 0
+  spilled || exit 0                      # back in VRAM ("on" again): nothing to drain
+  if in_swap "$dev"; then "$HERE/usm-vram-move.py" "$dev" || exit 1; fi
+  IN_DRAIN=1 full_stop
+  ;;
+sleep)   # before suspend/hibernate: fully off; exit 1 = cannot (the sleep is then refused)
+  systemctl is-active -q $UNIT || exit 0
+  dev=$(device)
+  # Back on after waking - unless the user had switched it off already (spilled, draining).
+  if ! spilled; then cp $ARGS $SLEEP_ARGS 2>/dev/null || echo "4096 0 4 0 $SPILL_DIR" > $SLEEP_ARGS; fi
+  if in_swap "$dev"; then
+    echo "going to sleep: moving $(used_mib "$dev") MiB out of the VRAM tier"
+    "$HERE/usm-vram-move.py" "$dev" || {
+      # Not enough room in RAM: the kernel pushes other pages to the disk swap meanwhile.
+      echo "RAM is tight - plain swapoff (pages go to the disk swap)"
+      swapoff "$dev" || { echo "cannot empty the VRAM tier - not going to sleep" >&2; rm -f $SLEEP_ARGS; exit 1; }
+    }
+  fi
+  IN_SLEEP=1 full_stop
+  ;;
+wake)    # after resume: back on as before
+  [ -e $SLEEP_ARGS ] || exit 0
+  read -r mb poll queues compress spilldir fake < $SLEEP_ARGS
+  rm -f $SLEEP_ARGS
+  [ "$compress" = 0 ] && compress=
+  exec 9>&-   # "on" takes the lock itself
+  USM_VRAM_QUEUES=$queues USM_VRAM_COMPRESS=$compress USM_VRAM_SPILL_DIR=$spilldir USM_VRAMD_FAKE=$fake \
+    "$HERE/usm-vramd-ctl" on "$mb" "$poll"
+  ;;
+hooks-install|hooks-remove)
+  SD=${2:?directory, e.g. /etc/systemd/system}
+  if [ "$1" = hooks-install ]; then USM_VRAM_NO_SLEEP_HOOK= install_hooks; else uninstall_hooks; fi
+  ;;
+status)
+  dev=$(device)
+  if in_swap "$dev"; then
+    st=$(last_move)
+    case "$st" in
+      spilled:*|"spill: nothing"*) echo "VRAM released: $dev keeps $(used_mib "$dev") MiB in $SPILL (into RAM once it has room)" ;;
+      "spill: copying"*|"fill: copying"*) echo "moving: $st" ;;
+      "spill stopped"*|"spill failed"*|"fill stopped"*|"fill failed"*) echo "on, partly in $SPILL: $st" ;;
+      *) awk -v d="$dev" '$1 == d {printf "on: %s, %d of %d MiB used, priority %s\n", d, $4 / 1024, $3 / 1024, $5}' /proc/swaps ;;
+    esac
+    if [ -s $STATS ]; then   # what the program itself says (updated every 5 s)
+      tr ' ' '\n' < $STATS | awk -F= '{v[$1] = $2} END {
+        if (v["compress"] + 0 > 0)
+          printf "  compressed: %d pages stored (%d all-zero, %d raw, the rest at %d%%): %d MiB of data", v["pages"], v["zero"], v["raw"], v["comp_pct"], v["live_mb"]
+        else
+          printf "  not compressed"
+        printf "; segments in VRAM %d MiB, on disk %d MiB; %d reads, %d writes, %d errors", v["in_vram_mb"], v["on_disk_mb"], v["reads"], v["writes"], v["errors"]
+        if (v["refused"] + 0 > 0) printf "; %d writes REFUSED (full)", v["refused"]
+        printf "\n" }'
+    fi
+  elif systemctl is-active -q $UNIT; then
+    echo "daemon running ($dev), not in use as swap"
+  else
+    echo "off"
+  fi
+  ;;
+*)
+  echo "usage: $0 on [VRAM_MB] [POLL_US] | off | drain | sleep | wake | status | hooks-install|hooks-remove DIR" >&2; exit 2
+  ;;
+esac

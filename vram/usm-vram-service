@@ -1,0 +1,87 @@
+#!/bin/bash
+# Called by usm-vram.service with the settings of /etc/usm/usm.conf in the environment.
+#   usm-vram-service start | stop      (the service)
+#   usm-vram-service auto-size         what VRAM_MB=auto means on this machine (MiB)
+HERE=$(cd "$(dirname "$0")" && pwd)
+DAEMON=$HERE/usm-vramd; [ -x "$DAEMON" ] || DAEMON=$HERE/../vram/usm-vramd
+# VRAM_MB=auto: all of the GPU's memory but 1 GiB (left for the driver and the odd video / GPU app), or, if this
+# GPU drives a screen, but 2 GiB or 30% (whichever is more) for the desktop's own graphics; never more than is
+# free right now minus 256 MiB; in steps of 256 MiB.
+auto_size() {
+  local probe total free shows keep mb
+  probe=$("$DAEMON" probe 2>/dev/null) || true
+  total=$(sed -n 's/.* total_mb=\([0-9]*\).*/\1/p' <<< "$probe")
+  free=$(sed -n 's/.* free_mb=\([0-9]*\).*/\1/p' <<< "$probe")
+  if [ -z "$total" ]; then
+    echo "VRAM_MB=auto: no usable NVIDIA GPU (${probe:-usm-vramd probe failed}) - set VRAM_MB or check: usm check" >&2
+    return 1
+  fi
+  shows=$(nvidia-smi --query-gpu=display_active --format=csv,noheader 2>/dev/null | sed -n 1p || true)
+  if [ "$shows" = Disabled ]; then keep=1024; else keep=$(( total * 30 / 100 )); [ "$keep" -lt 2048 ] && keep=2048; fi
+  mb=$(( total - keep ))
+  [ -n "$free" ] && [ "$free" -gt 0 ] && [ $(( free - 256 )) -lt "$mb" ] && mb=$(( free - 256 ))
+  mb=$(( mb / 256 * 256 ))
+  if [ "$mb" -lt 512 ]; then
+    echo "VRAM_MB=auto: the GPU has $total MiB ($free free) - too little left for a swap tier" >&2
+    return 1
+  fi
+  echo "$mb"
+}
+Z=/sys/module/zswap/parameters
+ZORIG=/run/usm-zswap.orig   # zswap as it was before the tier came on
+zswap_tier() {   # zswap while the tier is on (ZSWAP_POOL_WITH_TIER: percent of RAM, 0 = off, keep)
+  local want=${ZSWAP_POOL_WITH_TIER:-keep}
+  [ "$want" = keep ] || [ ! -w $Z/enabled ] && return 0
+  [ -e $ZORIG ] || echo "$(cat $Z/enabled) $(cat $Z/max_pool_percent)" > $ZORIG
+  if [ "$want" = 0 ]; then echo N > $Z/enabled; else echo "$want" > $Z/max_pool_percent; fi
+  echo "zswap while the VRAM tier is on: $( [ "$want" = 0 ] && echo off || echo "pool $want% of RAM") (was: $(cat $ZORIG))"
+}
+PCORIG=/run/usm-page-cluster.orig
+readahead_tier() {   # swap readahead while the tier is on (PAGE_CLUSTER_WITH_TIER: 2^N pages, keep)
+  local want=${PAGE_CLUSTER_WITH_TIER:-keep}
+  [ "$want" = keep ] && return 0
+  [ -e $PCORIG ] || cat /proc/sys/vm/page-cluster > $PCORIG
+  echo "$want" > /proc/sys/vm/page-cluster
+  echo "swap readahead while the VRAM tier is on: page-cluster $want (was: $(cat $PCORIG))"
+}
+readahead_restore() {
+  [ -e $PCORIG ] || return 0
+  cat $PCORIG > /proc/sys/vm/page-cluster
+  echo "swap readahead restored: page-cluster $(cat $PCORIG)"
+  rm -f $PCORIG
+}
+zswap_restore() {
+  [ -e $ZORIG ] || return 0
+  read -r en pool < $ZORIG
+  echo "$pool" > $Z/max_pool_percent; echo "$en" > $Z/enabled
+  rm -f $ZORIG
+  echo "zswap restored: enabled $en, pool $pool% of RAM"
+}
+case "$1" in
+auto-size)
+  auto_size ;;
+start)
+  mb=${VRAM_MB:-auto}
+  if [ "$mb" = auto ]; then
+    if [ -n "${TEST_DEVICE_MEMORY:-}" ]; then mb=$(( $(stat -c %s "$TEST_DEVICE_MEMORY") >> 20 ))
+    else mb=$(auto_size) || exit 1; fi
+    echo "VRAM_MB=auto: using $mb MiB"
+  fi
+  c=${COMPRESS:-0}; [ "$c" = 0 ] && c=
+  if [ -n "$c" ] && ! ldconfig -p | grep 'liblz4.so.1 ' > /dev/null; then
+    echo "COMPRESS=$COMPRESS but liblz4.so.1 is missing - running uncompressed (install liblz4)" >&2; c=
+  fi
+  # The sleep/wake hooks are installed for good (install.sh), not at run time.
+  env USM_VRAM_NO_SLEEP_HOOK=1 USM_VRAM_QUEUES="${QUEUES:-4}" USM_VRAM_COMPRESS="$c" \
+    USM_VRAM_SPILL_DIR="${SPILL_DIR:-/var/lib/usm-swap}" \
+    USM_VRAMD_FAKE="${TEST_DEVICE_MEMORY:-}" "$HERE/usm-vramd-ctl" on "$mb" || exit
+  zswap_tier
+  readahead_tier ;;
+stop)
+  env USM_VRAM_SPILL_DIR="${SPILL_DIR:-/var/lib/usm-swap}" "$HERE/usm-vramd-ctl" off; rc=$?
+  zswap_restore
+  readahead_restore
+  exit $rc ;;
+*)
+  echo "usage: $0 start | stop | auto-size" >&2; exit 2 ;;
+esac

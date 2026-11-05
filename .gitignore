@@ -1,0 +1,20 @@
+# build output
+/vram/usm-vramd
+/dist/
+/third_party/liburing/config-host.h
+/third_party/liburing/config-host.mak
+/third_party/liburing/config.log
+/third_party/liburing/src/include/liburing/compat.h
+/third_party/liburing/src/include/liburing/io_uring_version.h
+/third_party/liburing/src/*.a
+/third_party/liburing/src/*.o
+/third_party/liburing/src/*.ol
+/third_party/liburing/src/*.os
+/third_party/liburing/src/*.d
+/tests/desktop/hog
+__pycache__/
+*.pyc
+# editors
+/.idea/
+/.vscode/
+*.swp

@@ -1,0 +1,18 @@
+[Unit]
+Description=USM logger: records memory, swap, VRAM tier, guard and desktop lag every second (/var/log/usm, usm report)
+Documentation=https://github.com/kha333n/usm file:///usr/local/lib/usm/README.md
+After=local-fs.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=-/etc/usm/usm.conf
+ExecStart=/usr/bin/python3 /usr/local/lib/usm/usm-logger.py
+WatchdogSec=60
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

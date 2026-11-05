@@ -1,0 +1,18 @@
+[Unit]
+Description=USM: VRAM swap tier (GPU memory as fast swap)
+Documentation=https://github.com/kha333n/usm file:///usr/local/lib/usm/README.md
+After=local-fs.target systemd-modules-load.service nvidia-persistenced.service
+Wants=local-fs.target
+ConditionPathExists=/etc/usm/usm.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/usm/usm.conf
+ExecStart=/usr/local/lib/usm/usm-vram-service start
+ExecStop=/usr/local/lib/usm/usm-vram-service stop
+TimeoutStartSec=2min
+TimeoutStopSec=15min
+
+[Install]
+WantedBy=multi-user.target

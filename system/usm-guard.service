@@ -1,0 +1,20 @@
+[Unit]
+Description=USM guard: keeps the desktop responsive under memory overload (pauses big background apps, never the one in front)
+Documentation=https://github.com/kha333n/usm file:///usr/local/lib/usm/README.md
+After=local-fs.target usm-vram.service
+ConditionPathExists=/etc/usm/usm.conf
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=/etc/usm/usm.conf
+ExecStart=/usr/local/lib/usm/usm-guard-service start
+ExecStopPost=/usr/local/lib/usm/usm-guard-service thaw
+WatchdogSec=30
+Restart=on-failure
+RestartSec=5
+OOMScoreAdjust=-1000
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

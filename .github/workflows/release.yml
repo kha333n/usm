@@ -1,0 +1,51 @@
+# Push a tag vX.Y.Z (= the VERSION file with a v in front) -> GitHub release with the prebuilt tarball.
+# The daemon is built on Ubuntu 22.04 (glibc 2.35), so the binary also runs on older distributions.
+# Versions with alpha / beta / rc in the name are published as pre-releases.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc make libc6-dev python3
+      - name: The tag matches VERSION
+        run: test "v$(cat VERSION)" = "$GITHUB_REF_NAME"
+      - name: Build, check, pack
+        run: |
+          make
+          make check
+          make dist
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v=$(cat VERSION)
+          awk -v v="$v" '/^## / {p = index($0, "[" v "]") > 0; next} p' CHANGELOG.md > dist/notes.md
+          test -s dist/notes.md || echo "USM $v" > dist/notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=
+          case "$GITHUB_REF_NAME" in *alpha*|*beta*|*rc*) pre=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --repo "$GITHUB_REPOSITORY" \
+            --title "USM ${GITHUB_REF_NAME#v}" --notes-file dist/notes.md $pre

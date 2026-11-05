@@ -1,0 +1,81 @@
+#!/bin/bash
+# usm: switch USM's parts on or off, change settings, and see what they do.
+#   usm on | off              the VRAM swap tier (GPU memory as fast swap): now and at every boot
+#   usm guard on | off        the guard (keeps the desktop responsive under memory overload): now and at boot
+#   usm status                everything at a glance
+#   usm dash                  live view (q to quit)
+#   usm report [HOURS|DAY|all]   what happened (default: the last 24 hours)
+#   usm mark [NOTE]           note that the PC felt slow or hung just now (shows in the report)
+#   usm log [N]               the last N events
+#   usm config [show [--all] | get KEY | set KEY=VALUE ... | reset KEY ... | edit | check]
+#                             settings (/etc/usm/usm.conf); set/reset/edit check the values and apply them
+#   usm check                 what of USM works on this machine, and why not
+#   usm collect               pack logs + settings into ~/usm-logs-DATE.tar.gz (for a bug report)
+#   usm version
+#   usm uninstall [--purge]   remove USM (--purge: also settings and logs)
+set -u
+LIB=/usr/local/lib/usm
+need_root() { [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"; }
+case "${1:-status}" in
+on)
+  need_root "$@"
+  systemctl enable -q usm-vram.service
+  systemctl start usm-vram.service || { echo "could not switch on:"; journalctl -q -u usm-vram.service -n 15 -o cat; exit 1; }
+  "$LIB/usm-vramd-ctl" status ;;
+off)
+  need_root "$@"
+  systemctl disable -q usm-vram.service
+  systemctl stop usm-vram.service
+  "$LIB/usm-vramd-ctl" status ;;
+guard)
+  case "${2:-}" in
+  on)  need_root "$@"; systemctl enable -q --now usm-guard.service && echo "guard on (now and at boot)" ;;
+  off) need_root "$@"; systemctl disable -q --now usm-guard.service && echo "guard off (no app stays paused)" ;;
+  *)   echo "usm guard on|off"; exit 2 ;;
+  esac ;;
+status|dash|report|mark|log)
+  exec /usr/bin/python3 "$LIB/usm-tool.py" "$@" ;;
+config)
+  shift
+  case "${1:-show}" in
+    set|reset|edit) need_root config "$@" ;;
+  esac
+  exec /usr/bin/python3 "$LIB/usm_config.py" "${@:-show}" ;;
+check)
+  exec /usr/bin/python3 "$LIB/usm_check.py" ;;
+version|--version|-v)
+  echo "USM $(cat "$LIB/VERSION" 2>/dev/null || echo '?')"
+  "$LIB/usm-vramd" --version 2>/dev/null
+  if systemctl is-active -q usm-vramd; then
+    exe=$(readlink "/proc/$(systemctl show -p MainPID --value usm-vramd)/exe" 2>/dev/null)
+    case "$exe" in *deleted*) echo "(the running VRAM daemon is the previous version until: usm off && usm on)" ;; esac
+  fi ;;
+collect)
+  out=$HOME/usm-logs-$(date +%Y%m%d-%H%M).tar.gz
+  tmp=$(mktemp -d)
+  mkdir "$tmp/usm"
+  cp -a /var/log/usm "$tmp/usm/logs" 2>/dev/null
+  cp /etc/usm/usm.conf "$tmp/usm/" 2>/dev/null
+  { cat "$LIB/VERSION"; /usr/bin/python3 "$LIB/usm_check.py"; echo; /usr/bin/python3 "$LIB/usm-tool.py" status; echo;
+    /usr/bin/python3 "$LIB/usm-tool.py" report all; } > "$tmp/usm/status-and-report.txt" 2>&1
+  journalctl -q --no-pager -o short-iso --since -31days -u usm-vram.service -u usm-vramd.service -u usm-vramd-drain.service \
+    -u usm-guard.service -u usm-logger.service -u usm-vramd-sleep.service -u usm-vramd-wake.service -t usm-mark \
+    > "$tmp/usm/journal-usm.txt" 2>/dev/null
+  journalctl -q --no-pager -o short-iso --since -31days -k -g 'oom|Out of memory|hibernat|PM: suspend|ublk|NVRM' \
+    > "$tmp/usm/journal-kernel.txt" 2>/dev/null
+  { uname -a; free -m; cat /proc/swaps; cat /proc/cmdline; grep -H . /sys/module/zswap/parameters/* 2>/dev/null; } > "$tmp/usm/system.txt" 2>&1
+  tar -C "$tmp" -czf "$out" usm && rm -rf "$tmp" && echo "logs packed: $out ($(du -h "$out" | cut -f1))"
+  echo "it contains app names, memory figures and system details (no file contents) - look before sharing" ;;
+uninstall)
+  need_root "$@"
+  # Run a copy: the uninstaller removes $LIB, where it lives.
+  tmp=$(mktemp /tmp/usm-uninstall.XXXXXX)
+  cp "$LIB/uninstall.sh" "$tmp" && chmod 700 "$tmp"
+  bash "$tmp" "${@:2}"; rc=$?
+  rm -f "$tmp"
+  exit $rc ;;
+help|-h|--help)
+  sed -n '2,17p' "$0" | sed 's/^# //' ;;
+*)
+  sed -n '2,17p' "$0" | sed 's/^# //'; exit 2 ;;
+esac

@@ -1,0 +1,13 @@
+#!/bin/bash
+# usm-helper: the only things the desktop (GNOME extension usm-desktop) may run as root, via pkexec.
+# Polkit action org.usm.switch (/usr/share/polkit-1/actions/org.usm.switch.policy) allows it without a password
+# for the user at the machine (active local session); anyone else needs an admin password.
+set -u
+export PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+case "${1:-}" in
+tier-on)   exec /usr/local/sbin/usm on ;;
+tier-off)  exec /usr/local/sbin/usm off ;;
+guard-on)  exec /usr/local/sbin/usm guard on ;;
+guard-off) exec /usr/local/sbin/usm guard off ;;
+*) echo "usage: usm-helper tier-on|tier-off|guard-on|guard-off" >&2; exit 2 ;;
+esac
