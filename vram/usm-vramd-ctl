@@ -32,7 +32,9 @@ PM=/run/usm-vramd.gpu-power          # the GPU's runtime power setting before "o
 SPILL_DIR=$(realpath -m "${USM_VRAM_SPILL_DIR:-/var/lib/usm-swap}")   # as /proc/swaps shows paths
 SPILL=$SPILL_DIR/vram-spill
 STANDBY_MB=${USM_VRAM_STANDBY_MB:-auto}
-ARGS=/run/usm-vramd.args             # how "on" was called (VRAM_MB POLL QUEUES COMPRESS SPILL_DIR STANDBY_MB [test memory])
+GPU_FREE_MB=${USM_VRAM_GPU_FREE_MB:-1024}   # VRAM kept free for other programs once they use the GPU (off = never give back)
+[ "$GPU_FREE_MB" = off ] && GPU_FREE_MB=0
+ARGS=/run/usm-vramd.args             # how "on" was called (VRAM_MB POLL QUEUES COMPRESS SPILL_DIR STANDBY_MB GPU_FREE_MB [test memory])
 SLEEP_ARGS=/run/usm-vramd.sleep-args # the tier was on when the machine went to sleep
 SD=${USM_VRAM_HOOK_DIR:-/run/systemd/system}   # runtime units: gone at reboot, like the tier itself
 STATS=/run/usm-vramd.stats           # the program's status line (every 5 s)
@@ -58,7 +60,10 @@ last_move() { log | grep -E '^(spill|fill|spilled|filled)(:| failed| stopped)' |
 spilled() {
   local m; m=$(last_move)
   # The journal may have been trimmed since the last move: then the program's status line tells.
-  if [ -z "$m" ] && [ -s $STATS ]; then grep -q 'vram_held=0' $STATS; return; fi
+  if [ -z "$m" ] && [ -s $STATS ]; then
+    if grep -q 'switched_off=' $STATS; then grep -q 'switched_off=1' $STATS; else grep -q 'vram_held=0' $STATS; fi
+    return
+  fi
   case "$m" in spilled:*|"spill: nothing"*) return 0;; *) return 1;; esac
 }
 in_swap() { [ -n "$1" ] && grep -q "^$1 " /proc/swaps; }
@@ -265,6 +270,7 @@ on)
   # swaps the user turned off, e.g. zram), and at shutdown swap is turned off while it still runs.
   systemd-run -q --unit=$UNIT --collect -p DefaultDependencies=no -p OOMScoreAdjust=-1000 \
     ${USM_VRAMD_FAKE:+-E USM_VRAMD_FAKE=$USM_VRAMD_FAKE} -E USM_VRAMD_SPILL="$SPILL" \
+    -E USM_VRAMD_GPU_FREE_MB="$GPU_FREE_MB" ${USM_VRAMD_FAKE_GPU:+-E USM_VRAMD_FAKE_GPU=$USM_VRAMD_FAKE_GPU} \
     ${USM_VRAM_COMPRESS:+-E USM_VRAMD_COMPRESS=$USM_VRAM_COMPRESS} -E USM_VRAMD_STATS=$STATS \
     ${SB:+-E USM_VRAMD_STANDBY=$SB -E USM_VRAMD_STANDBY_PRIO=$((PRIO + 1))} \
     "$HERE/usm-vramd" "${2:-4096}" "${USM_VRAM_QUEUES:-4}" 32 "${3:-0}"
@@ -289,7 +295,7 @@ on)
   mkswap -L usmvram "$dev" > /dev/null
   # Compressed mode: swap tells the program which pages it no longer needs (their space is reused).
   swapon -p "$PRIO" ${USM_VRAM_COMPRESS:+--discard=pages} "$dev"
-  echo "${2:-4096} ${3:-0} ${USM_VRAM_QUEUES:-4} ${USM_VRAM_COMPRESS:-0} $SPILL_DIR $STANDBY_MB ${USM_VRAMD_FAKE:-}" > $ARGS
+  echo "${2:-4096} ${3:-0} ${USM_VRAM_QUEUES:-4} ${USM_VRAM_COMPRESS:-0} $SPILL_DIR $STANDBY_MB $GPU_FREE_MB ${USM_VRAMD_FAKE:-}" > $ARGS
   install_hooks
   echo "VRAM swap on: $dev, $(( $(blockdev --getsize64 "$dev") >> 20 )) MiB at priority $PRIO"
   if [ -n "$SB" ]; then echo "standby swap: $SB, $(( $(stat -c %s "$SB") >> 20 )) MiB (priority $((PRIO + 1)) while in use)"
@@ -356,12 +362,14 @@ sleep)   # before suspend/hibernate: fully off; exit 1 = cannot (the sleep is th
   ;;
 wake)    # after resume: back on as before
   [ -e $SLEEP_ARGS ] || exit 0
-  read -r mb poll queues compress spilldir standby fake < $SLEEP_ARGS
+  read -r mb poll queues compress spilldir standby gpufree fake < $SLEEP_ARGS
   rm -f $SLEEP_ARGS
   [ "$compress" = 0 ] && compress=
+  case "${gpufree:-}" in /*) fake=$gpufree; gpufree= ;; esac   # written by 0.1.0-beta.2
   case "${standby:-}" in /*) fake=$standby; standby=auto ;; "") standby=auto ;; esac   # written by 0.1.0-beta.1
   exec 9>&-   # "on" takes the lock itself
   USM_VRAM_QUEUES=$queues USM_VRAM_COMPRESS=$compress USM_VRAM_SPILL_DIR=$spilldir USM_VRAM_STANDBY_MB=$standby USM_VRAMD_FAKE=$fake \
+    USM_VRAM_GPU_FREE_MB=${gpufree:-1024} \
     "$HERE/usm-vramd-ctl" on "$mb" "$poll"
   ;;
 hooks-install|hooks-remove)
@@ -386,7 +394,11 @@ status)
           printf "  not compressed"
         printf "; segments in VRAM %d MiB, on disk %d MiB; %d reads, %d writes, %d errors", v["in_vram_mb"], v["on_disk_mb"], v["reads"], v["writes"], v["errors"]
         if (v["refused"] + 0 > 0) printf "; %d writes refused (no room)", v["refused"]
-        printf "\n" }'
+        printf "\n"
+        if (v["given_back_mb"] + 0 > 0 && v["switched_off"] == "0")
+          printf "  VRAM given back to other programs: %d of %d MiB (any data from it waits in the spill file until they are done)\n", v["given_back_mb"], v["vram_mb"]
+        else if (v["gpu_keep_mb"] + 0 > 0 && v["switched_off"] != "1")
+          printf "  gives VRAM back once other programs use the GPU (keeps %d MiB free for them)\n", v["gpu_keep_mb"] }'
     fi
     standby_status
   elif systemctl is-active -q $UNIT; then

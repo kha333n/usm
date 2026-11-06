@@ -30,6 +30,11 @@
 // Standby swap (USM_VRAMD_STANDBY=FILE, USM_VRAMD_STANDBY_PRIO=N, a swap file made by usm-vramd-ctl):
 // switched on above this device whenever the VRAM is nearly full or data is in the spill file, so the
 // kernel itself writes new pages to the disk. See "the standby swap" below for why that matters.
+//
+// Giving VRAM back (USM_VRAMD_GPU_FREE_MB=N, default 1024; 0 = never): once other programs start using
+// the GPU, VRAM is given back to them in 64 MiB pieces until N MiB are free (the data of a piece moves to
+// the spill file first, as in a spill), and taken back once they have been done for 30 s.
+// Test mode: USM_VRAMD_FAKE_GPU=FILE holds how many MiB "other programs" use.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -85,6 +90,7 @@ static CUresult (*cuDevicePrimaryCtxRetain)(CUcontext *, int);
 static CUresult (*cuCtxSetCurrent)(CUcontext);
 static CUresult (*cuMemAlloc)(CUdeviceptr *, size_t);
 static CUresult (*cuMemFree)(CUdeviceptr);
+static CUresult (*cuMemGetInfo)(size_t *, size_t *);
 static CUresult (*cuMemHostRegister)(void *, size_t, unsigned);
 static CUresult (*cuMemcpyHtoDAsync)(CUdeviceptr, const void *, size_t, CUstream);
 static CUresult (*cuMemcpyDtoHAsync)(void *, CUdeviceptr, size_t, CUstream);
@@ -237,7 +243,6 @@ static unsigned dev_id;
 static int quit_fd = -1, cfd = -1, nr_queues, depth, poll_us;
 static size_t vram_bytes;   // size of the device (and of the VRAM it borrows while the data is there)
 static CUcontext ctx;
-static CUdeviceptr vram;
 static sigset_t ctl_signals;
 static char *fake_mem;   // test mode: device memory mapped from a PCI BAR instead of CUDA VRAM
 static pthread_mutex_t ready_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -253,7 +258,22 @@ static size_t nr_chunks;
 static pthread_rwlock_t move_lock;
 static const char *spill_path;   // USM_VRAMD_SPILL
 static int spill_fd = -1;        // open while any chunk lives in the file
-static int vram_held = 1;        // the VRAM allocation exists (released after a full spill)
+
+// The VRAM is borrowed in slabs of SLAB bytes (the last one may be smaller), so it can be given back a
+// piece at a time (see "giving VRAM back"). Every chunk of a slab that is not held lives in the spill file.
+// Only the mover changes these; the queues use slab_ptr only for chunks in VRAM.
+#define SLAB (64u << 20)
+#define CPS (SLAB / CHUNK)        // chunks per slab
+static CUdeviceptr *slab_ptr;
+static unsigned char *slab_held;  // its VRAM is allocated
+static unsigned char *slab_leaving;   // compressed mode: being given back, its free segments are not handed out
+static size_t nr_slabs, slabs_held;
+static long long held_b;          // bytes of VRAM held
+static inline size_t slab_len(size_t k) {
+    size_t end = (k + 1) * (size_t)SLAB;
+    return (end > vram_bytes ? vram_bytes : end) - k * (size_t)SLAB;
+}
+static inline CUdeviceptr vptr(unsigned long long off) { return slab_ptr[off / SLAB] + off % SLAB; }
 // Our own disk I/O is allowed only while this is set: the standby swap is on and has room (see "the
 // standby swap"). Without it, writes that would go to the spill file are refused instead.
 static int sb_room_ok;
@@ -286,8 +306,8 @@ static void mark_ready(struct queue *q, int err) {
 static int dev_copy(struct queue *q, int to_dev, unsigned long long off, char *buf, unsigned len) {
     q->pending++;
     if (!fake_mem)
-        return to_dev ? cuMemcpyHtoDAsync(vram + off, buf, len, q->stream)
-                      : cuMemcpyDtoHAsync(buf, vram + off, len, q->stream);
+        return to_dev ? cuMemcpyHtoDAsync(vptr(off), buf, len, q->stream)
+                      : cuMemcpyDtoHAsync(buf, vptr(off), len, q->stream);
     unsigned long pages = (len + 4095) / 4096, fixed = to_dev ? 2900 : 3100;
     if (to_dev)
         memcpy(fake_mem + off, buf, len);
@@ -387,8 +407,9 @@ static size_t dev_bytes;               // size of the device (plain mode: vram_b
 static uint64_t *pmap;                 // per page: E_PRESENT [E_ZERO] | seg << 29 | (off / 16) << 13 | (len - 1)
 static uint32_t *seg_live;             // live bytes per segment
 static int *seg_open;
-static uint32_t *free_segs;            // stack of free segments
-static size_t free_n, gc_low, gc_high;
+static uint32_t *free_segs;            // stack of free segments in VRAM
+static uint32_t *ffree_segs, *seg_tmp; // stack of free segments in the spill file (VRAM given back, spilled)
+static size_t free_n, ffree_n, gc_low, gc_high;
 static pthread_mutex_t seg_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t seg_cv = PTHREAD_COND_INITIALIZER;   // the compactor freed segments
 static struct queue *all_queues;
@@ -403,10 +424,36 @@ static inline unsigned e_off(uint64_t e) { return (unsigned)((e >> 13) & 0xffff)
 static inline unsigned e_len(uint64_t e) { return (unsigned)(e & 0x1fff) + 1; }
 static inline int e_stored(uint64_t e) { return (e & E_PRESENT) && !(e & E_ZERO); }
 
+// Which stack a free segment belongs on (caller holds seg_mx). Only the mover moves chunks, and it puts
+// every free segment back on the right stack afterwards (seg_repartition).
+static void seg_put(size_t s) {
+    if (chunk_state[s] == C_VRAM && !slab_leaving[s / CPS])
+        free_segs[free_n++] = (uint32_t)s;
+    else
+        ffree_segs[ffree_n++] = (uint32_t)s;
+}
+
 static void seg_push_free(size_t s) {
     __atomic_store_n(&chunk_written[s], 0, __ATOMIC_RELAXED);   // nothing in it for a spill to copy
     pthread_mutex_lock(&seg_mx);
-    free_segs[free_n++] = (uint32_t)s;
+    seg_put(s);
+    pthread_cond_broadcast(&seg_cv);
+    pthread_mutex_unlock(&seg_mx);
+}
+
+// Slabs were given back or taken again: every free segment onto the stack for where it lives now (mover).
+static void seg_repartition(void) {
+    if (!cz_ratio)
+        return;
+    pthread_mutex_lock(&seg_mx);
+    size_t n = 0;
+    for (size_t i = 0; i < free_n; i++)
+        seg_tmp[n++] = free_segs[i];
+    for (size_t i = 0; i < ffree_n; i++)
+        seg_tmp[n++] = ffree_segs[i];
+    free_n = ffree_n = 0;
+    for (size_t i = 0; i < n; i++)
+        seg_put(seg_tmp[i]);
     pthread_cond_broadcast(&seg_cv);
     pthread_mutex_unlock(&seg_mx);
 }
@@ -433,13 +480,15 @@ static long seg_alloc(int owner, size_t reserve) {
     pthread_mutex_lock(&seg_mx);
     if (free_n > reserve)
         s = free_segs[--free_n];
-    size_t left = free_n;
+    else if (ffree_n > reserve)   // none left in VRAM: one in the spill file (its writes need the standby swap)
+        s = ffree_segs[--ffree_n];
+    size_t left = free_n, all = free_n + ffree_n;
     pthread_mutex_unlock(&seg_mx);
     if (s >= 0) {
         __atomic_store_n(&seg_open[s], owner, __ATOMIC_RELEASE);
         __atomic_store_n(&chunk_written[s], 1, __ATOMIC_RELAXED);   // in use: a spill copies it
     }
-    if (left < gc_low)   // compact the VRAM
+    if (all < gc_low)   // compact
         want_gc();
     if (left < sb_on_free)   // nearly full: the standby swap takes new pages from now on
         want_standby();
@@ -503,7 +552,7 @@ static int next_segment(struct queue *q) {
             until.tv_nsec -= 1000000000L;
         }
         pthread_mutex_lock(&seg_mx);
-        while (free_n <= SEG_RESERVE && !pthread_cond_timedwait(&seg_cv, &seg_mx, &until))
+        while (free_n <= SEG_RESERVE && ffree_n <= SEG_RESERVE && !pthread_cond_timedwait(&seg_cv, &seg_mx, &until))
             ;
         pthread_mutex_unlock(&seg_mx);
         pthread_rwlock_rdlock(&move_lock);
@@ -806,8 +855,8 @@ static int chunk_copy(int to_vram, size_t c, char *buf) {
         fake_wait((CHUNK / 4096) * (to_vram ? 1800 : 1400) + (to_vram ? 2900 : 3100));
         return 0;
     }
-    CUresult r = to_vram ? cuMemcpyHtoDAsync(vram + off, buf, CHUNK, move_stream)
-                         : cuMemcpyDtoHAsync(buf, vram + off, CHUNK, move_stream);
+    CUresult r = to_vram ? cuMemcpyHtoDAsync(vptr(off), buf, CHUNK, move_stream)
+                         : cuMemcpyDtoHAsync(buf, vptr(off), CHUNK, move_stream);
     return r || cuStreamSynchronize(move_stream) ? -1 : 0;
 }
 
@@ -841,9 +890,10 @@ static void want_gc(void) {
     pthread_mutex_unlock(&move_mx);
 }
 
-static size_t free_count(void) {
+// Free segments: all of them (in_vram = 0) or those in VRAM.
+static size_t free_count(int in_vram) {
     pthread_mutex_lock(&seg_mx);
-    size_t n = free_n;
+    size_t n = free_n + (in_vram ? 0 : ffree_n);
     pthread_mutex_unlock(&seg_mx);
     return n;
 }
@@ -853,6 +903,8 @@ static long gc_seg_alloc(void) {
     pthread_mutex_lock(&seg_mx);
     if (free_n)
         s = free_segs[--free_n];
+    else if (ffree_n)
+        s = ffree_segs[--ffree_n];
     pthread_mutex_unlock(&seg_mx);
     if (s >= 0) {
         __atomic_store_n(&seg_open[s], nr_queues + 1, __ATOMIC_RELEASE);
@@ -947,7 +999,7 @@ static void gc(void) {
     __atomic_store_n(&gc_wanted, 0, __ATOMIC_RELAXED);
     if (!cz_ratio)
         return;
-    for (int round = 0; round < 64 && free_count() < gc_high; round++)
+    for (int round = 0; round < 64 && free_count(0) < gc_high; round++)
         if (!gc_pass())
             break;
 }
@@ -1255,9 +1307,9 @@ static void *sb_main(void *arg) {
         pthread_mutex_unlock(&sb_wake_mx);
         if (quit)
             break;
-        size_t fr = cz_ratio ? free_count() : nr_chunks;
+        size_t fr = cz_ratio ? free_count(1) : nr_chunks;
         int in_file = __atomic_load_n(&spill_fd, __ATOMIC_RELAXED) >= 0;   // data in (or on its way to) the spill file
-        int full = cz_ratio && __atomic_load_n(&vram_held, __ATOMIC_RELAXED) && fr < sb_on_free;
+        int full = cz_ratio && __atomic_load_n(&slabs_held, __ATOMIC_RELAXED) && fr < sb_on_free;
         int st = __atomic_load_n(&sb_state, __ATOMIC_ACQUIRE);
         if (full || in_file) {
             if (st != SB_ON)
@@ -1346,9 +1398,411 @@ static size_t count_state(int st, int only_written) {
     return n;
 }
 
+// Chunks [*c0, *c1) of slab k.
+static void slab_chunks(size_t k, size_t *c0, size_t *c1) {
+    *c0 = k * CPS;
+    *c1 = *c0 + slab_len(k) / CHUNK;
+}
+
+static size_t slab_count(size_t k, int st) {
+    size_t c0, c1, n = 0;
+    slab_chunks(k, &c0, &c1);
+    for (size_t c = c0; c < c1; c++)
+        n += chunk_state[c] == st;
+    return n;
+}
+
+static size_t slab_data(size_t k) {   // chunks with data
+    size_t c0, c1, n = 0;
+    slab_chunks(k, &c0, &c1);
+    for (size_t c = c0; c < c1; c++)
+        n += written(c);
+    return n;
+}
+
+// ---- the spill file ----
+static int spill_mode;   // how its space is reserved: 2 written zeros, 1 plain, 0 only for the chunks with data
+static const char *spill_how[] = {"space reserved for the current data only (disk too full for all of it)",
+                                  "space reserved", "zeroed in advance"};
+
+// Open (create) it. Returns NULL, or why not.
+static const char *spill_open(void) {
+    static char why[PATH_MAX + 128];
+    if (spill_fd >= 0)
+        return NULL;
+    if (!spill_path)
+        return "no spill file set (USM_VRAMD_SPILL)";
+    int fd = open(spill_path, O_RDWR | O_CREAT | O_EXCL | O_DIRECT | O_CLOEXEC, 0600);
+    if (fd < 0 || ftruncate(fd, (off_t)vram_bytes)) {
+        snprintf(why, sizeof why, "%s: %s", spill_path, strerror(errno));
+        if (fd >= 0) {
+            close(fd);
+            unlink(spill_path);
+        }
+        return why;
+    }
+    spill_mode = 2;
+    // The queues use it only for chunks that move there later (each under the lock).
+    __atomic_store_n(&spill_fd, fd, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+// Reserve disk space for the chunks of [c0, c1) that are in VRAM now: no "disk full" later, and no block
+// allocation while serving. Their place in the file holds nothing, so it may be zeroed - written zeros, if the
+// disk can do that without sending data: then later writes need no file system changes either (direct
+// overwrites of allocated blocks). Returns 0, or -1 (errno set).
+static int spill_reserve(size_t c0, size_t c1) {
+    for (size_t c = c0; c < c1;) {
+        if (chunk_state[c] != C_VRAM) {
+            c++;
+            continue;
+        }
+        size_t e = c + 1;
+        while (e < c1 && chunk_state[e] == C_VRAM)
+            e++;
+        off_t a = (off_t)c * CHUNK, len = (off_t)(e - c) * CHUNK;
+        if (spill_mode == 2 && fallocate(spill_fd, FALLOC_FL_WRITE_ZEROES, a, len))
+            spill_mode = 1;
+        if (spill_mode == 1 && fallocate(spill_fd, 0, a, len)) {
+            // Not enough disk space for all of it: drop what got reserved of this part, then reserve room for
+            // the data there is now; space for swap space never used so far is taken when it gets used.
+            fallocate(spill_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, a, len);
+            spill_mode = 0;
+        }
+        if (!spill_mode)
+            for (size_t i = c; i < e; i++)
+                if (written(i) && fallocate(spill_fd, 0, (off_t)i * CHUNK, CHUNK))
+                    return -1;
+        c = e;
+    }
+    return 0;
+}
+
+// Nothing lives in it any more: close and delete it. Returns 1 if it did.
+static int spill_close(void) {
+    if (spill_fd < 0 || count_state(C_FILE, 0))
+        return 0;
+    pthread_rwlock_wrlock(&move_lock);
+    close(spill_fd);
+    __atomic_store_n(&spill_fd, -1, __ATOMIC_RELEASE);
+    pthread_rwlock_unlock(&move_lock);
+    unlink(spill_path);
+    return 1;
+}
+
+// ---- giving VRAM back ----
+// CUDA does not share VRAM between programs: once ours is taken, other programs' allocations simply fail
+// (CUDA_ERROR_OUT_OF_MEMORY) - an AI model, a game, a video editor. So the mover watches the GPU's free memory
+// (every GPU_TICK_MS). Other programs' use = total - free - ours. Once it is GPU_BUSY above what it was at our
+// start, they are using the GPU: slabs go back to them (the least data first: empty ones at once, the others
+// after their data moved to the spill file, as in a spill) until gpu_keep is free - and more while they keep
+// growing. Once their use has been back down for GPU_QUIET_S, the slabs are taken again (as long as what was
+// free at our start stays free) and their data moves back. A request to switch off (spill) stays: then nothing
+// is taken back until a fill. There is no warning before an allocation: a program that takes a lot of VRAM in
+// one go right at its start may still find too little free.
+#define GPU_TICK_MS 50
+#define GPU_BUSY (64ll << 20)
+#define GPU_QUIET_S 30
+#define FAKE_GPU_SPARE (256ll << 20)          // test mode: the fake GPU has this much more than we borrow
+static long long gpu_keep = 1024ll << 20;     // USM_VRAMD_GPU_FREE_MB; 0 = never give VRAM back
+static const char *gpu_fake;                  // test mode: USM_VRAMD_FAKE_GPU
+static long long gpu_others0 = -1, gpu_free0; // other programs' use at our start (the lowest seen since); free then
+static long long gpu_free_now = -1, gpu_others_now = -1;   // last seen (for the status line)
+static double gpu_quiet_since, gpu_retry;
+static int user_off;   // switched off on request (spill): nothing is taken back by itself
+enum { R_DONE = 1, R_STOPPED = 0, R_FAILED = -1, R_BUSY = -2, R_NO_VRAM = -3 };
+
+static const char *r_text(int r) {
+    return r == R_FAILED ? "copy or disk error" : r == R_BUSY ? "busy chunk, standby swap full"
+         : r == R_NO_VRAM ? "no VRAM free" : "a request came";
+}
+
+static int gpu_info(long long *fr, long long *others) {
+    long long f, t, held = __atomic_load_n(&held_b, __ATOMIC_RELAXED);
+    if (fake_mem) {
+        char buf[64];
+        if (!gpu_fake || read_proc(gpu_fake, buf, sizeof buf))
+            return -1;
+        t = (long long)vram_bytes + FAKE_GPU_SPARE;
+        f = t - held - (strtoll(buf, NULL, 10) << 20);
+        if (f < 0)
+            f = 0;
+    } else {
+        size_t a, b;
+        if (cuMemGetInfo(&a, &b))
+            return -1;
+        f = (long long)a;
+        t = (long long)b;
+    }
+    *fr = f;
+    *others = t - f - held;
+    __atomic_store_n(&gpu_free_now, f, __ATOMIC_RELAXED);
+    __atomic_store_n(&gpu_others_now, *others, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static int gpu_busy(long long others) {
+    return gpu_others0 >= 0 && others > gpu_others0 + GPU_BUSY;
+}
+
+static CUresult slab_alloc(size_t k) {
+    if (!fake_mem)
+        return cuMemAlloc(&slab_ptr[k], slab_len(k));
+    long long fr, others;   // test mode: only as much as the fake GPU has free
+    return gpu_fake && !gpu_info(&fr, &others) && fr < (long long)slab_len(k) ? 2 : 0;
+}
+
+// Move slab k's data to the spill file (open, space reserved, the standby swap on) and give its VRAM back.
+// Returns R_DONE (given back), R_STOPPED (cmd: see interrupted), or a move_chunk error (it stays, partly moved).
+static int slab_out(size_t k, int cmd, size_t *copied, size_t *again) {
+    size_t c0, c1;
+    slab_chunks(k, &c0, &c1);
+    slab_leaving[k] = 1;   // compressed mode: its free segments are not handed out meanwhile
+    seg_repartition();
+    int r = R_DONE;
+    for (size_t c = c0; c < c1 && r == R_DONE; c++) {
+        if (chunk_state[c] != C_VRAM)
+            continue;
+        if (interrupted(cmd)) {
+            r = R_STOPPED;
+            break;
+        }
+        if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))   // new pages keep coming meanwhile
+            gc();
+        int m = move_chunk(c, 1, again);
+        if (m < 0)
+            r = m;
+        else
+            *copied += (size_t)m;
+    }
+    if (r == R_DONE && slab_count(k, C_VRAM))
+        r = R_STOPPED;
+    if (r == R_DONE) {
+        // Every batch that copied from this slab finished before its last chunk changed place (that took the
+        // lock), and no batch since sees any of it in VRAM: give it back.
+        if (fake_mem)
+            memset(fake_mem + c0 * CHUNK, 0x5a, slab_len(k));   // test mode: whatever still reads there gets garbage
+        else
+            cuMemFree(slab_ptr[k]);
+        slab_held[k] = 0;
+        __atomic_sub_fetch(&slabs_held, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&held_b, (long long)slab_len(k), __ATOMIC_RELAXED);
+    }
+    slab_leaving[k] = 0;
+    seg_repartition();
+    return r;
+}
+
+// Get slab k's VRAM again (if not held) and move its data back from the spill file. keep >= 0: only if this
+// much GPU memory stays free for other programs. *cuerr: the CUDA error if the VRAM could not be had.
+static int slab_in(size_t k, int cmd, long long keep, size_t *copied, size_t *again, int *cuerr) {
+    size_t c0, c1;
+    slab_chunks(k, &c0, &c1);
+    if (!slab_held[k]) {
+        long long fr, others;
+        if (keep >= 0 && (gpu_info(&fr, &others) || fr - (long long)slab_len(k) < keep))
+            return R_NO_VRAM;
+        CUresult e = slab_alloc(k);
+        if (e) {
+            *cuerr = e;
+            return R_NO_VRAM;
+        }
+        slab_held[k] = 1;   // its chunks are all still in the file: the queues do not use it before they move
+        __atomic_add_fetch(&slabs_held, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&held_b, (long long)slab_len(k), __ATOMIC_RELAXED);
+    }
+    int r = R_DONE;
+    for (size_t c = c0; c < c1; c++) {
+        if (chunk_state[c] != C_FILE)
+            continue;
+        if (interrupted(cmd)) {
+            r = R_STOPPED;
+            break;
+        }
+        if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))
+            gc();
+        int m = move_chunk(c, 0, again);
+        if (m < 0) {
+            r = m;
+            break;
+        }
+        *copied += (size_t)m;
+    }
+    seg_repartition();
+    return r;
+}
+
+// The next slab to give back: held, with the least data (ties: the highest). -1: none.
+static long slab_to_give(void) {
+    long best = -1;
+    size_t bd = 0;
+    for (size_t k = nr_slabs; k-- > 0;)
+        if (slab_held[k]) {
+            size_t d = slab_data(k);
+            if (best < 0 || d < bd) {
+                best = (long)k;
+                bd = d;
+            }
+        }
+    return best;
+}
+
+// The next slab to take back: not held, with the most data (ties: the lowest); then held ones with data in
+// the spill file. -1: none.
+static long slab_to_take(void) {
+    long best = -1;
+    size_t bd = 0;
+    for (size_t k = 0; k < nr_slabs; k++)
+        if (!slab_held[k]) {
+            size_t d = slab_data(k);
+            if (best < 0 || d > bd) {
+                best = (long)k;
+                bd = d;
+            }
+        }
+    for (size_t k = 0; best < 0 && k < nr_slabs; k++)
+        if (slab_count(k, C_FILE))
+            best = (long)k;
+    return best;
+}
+
+static void gpu_yield(long long fr, long long others) {
+    double t0 = now_us();
+    size_t given = 0, copied = 0, again = 0;
+    const char *why = NULL;
+    char err[128];
+    printf("yield: other programs use %lld MiB more VRAM than at the start, %lld MiB free - giving VRAM back"
+           " until %lld MiB are free\n", (others - gpu_others0) >> 20, fr >> 20, gpu_keep >> 20);
+    for (int more = 1; more && fr < gpu_keep;) {
+        // As many slabs as are missing, then look again (the other program may keep growing). Few driver calls:
+        // while another program's allocations keep failing, each of ours waits behind them in the driver.
+        // Empty slabs go at once: nothing can be read from them, and writes there are refused until the standby
+        // swap is on (below). Slabs with data move to the spill file first, with the standby swap on.
+        for (long long need = gpu_keep - fr; need > 0;) {
+            long k = slab_to_give();
+            if (k < 0) {
+                more = 0;   // all of it given back
+                break;
+            }
+            int empty = !slab_data((size_t)k);
+            if (!empty && !standby_on("VRAM goes back to other programs")) {
+                why = "no standby swap to take new pages meanwhile (see STANDBY_MB)";
+                break;
+            }
+            if ((why = spill_open()))
+                break;
+            if (!empty) {
+                standby_on("data moves to the spill file");   // stays on while the file is open (the controller sees it)
+                size_t c0, c1;
+                slab_chunks((size_t)k, &c0, &c1);
+                if (spill_reserve(c0, c1)) {
+                    snprintf(err, sizeof err, "cannot reserve disk space in %s: %s", spill_path, strerror(errno));
+                    why = err;
+                    break;
+                }
+            }
+            int r = slab_out((size_t)k, M_NONE, &copied, &again);
+            if (r != R_DONE) {
+                why = r_text(r);
+                break;
+            }
+            given += slab_len((size_t)k);
+            need -= (long long)slab_len((size_t)k);
+        }
+        if (why || gpu_info(&fr, &others))
+            break;
+    }
+    if (given) {
+        // The VRAM is out: now the standby swap goes on (and stays on while the spill file is open), and the space
+        // of the slabs given back is reserved in the file - plainly, never zeroed: a write may have landed there.
+        if (!standby_on("VRAM went back to other programs") && !why)
+            why = "no standby swap yet: writes there are refused meanwhile";
+        for (size_t k = 0; k < nr_slabs; k++)
+            if (!slab_held[k] && fallocate(spill_fd, 0, (off_t)k * SLAB, (off_t)slab_len(k)))
+                break;   // disk full: space is taken when it gets used
+    }
+    if (why)
+        gpu_retry = now_us() + 10e6;   // not again right away
+    spill_close();                     // nothing went there after all
+    printf("yield: %zu MiB of VRAM given back in %.2f s (%zu MiB of data moved to the spill file)%s%s; %lld MiB"
+           " free now\n", given >> 20, (now_us() - t0) / 1e6, copied * (CHUNK >> 20), why ? " - stopped: " : "",
+           why ? why : "", fr >> 20);
+}
+
+static void gpu_regrow(void) {
+    long long keep = gpu_free0 > (32ll << 20) ? gpu_free0 - (32ll << 20) : 0;   // what was free at our start
+    double t0 = 0;
+    size_t taken = 0, copied = 0, again = 0;
+    const char *why = NULL;
+    char err[64];
+    int cuerr = 0;
+    for (long k; (k = slab_to_take()) >= 0;) {
+        long long fr, others;
+        int held = slab_held[k];
+        if (!held && (gpu_info(&fr, &others) || fr - (long long)slab_len((size_t)k) < keep))
+            break;   // no room (yet)
+        if (!t0) {
+            t0 = now_us();
+            printf("regrow: other programs are done with the GPU - taking VRAM back\n");
+        }
+        standby_on("data moves back from the spill file");   // on already (the file is open)
+        int r = slab_in((size_t)k, M_NONE, -1, &copied, &again, &cuerr);
+        if (!held && slab_held[k])
+            taken += slab_len((size_t)k);
+        if (r != R_DONE) {
+            why = r_text(r);
+            if (cuerr) {
+                snprintf(err, sizeof err, "cannot get VRAM (CUDA error %d)", cuerr);
+                why = err;
+            }
+            gpu_retry = now_us() + 30e6;
+            break;
+        }
+    }
+    if (!t0)
+        return;
+    int closed = spill_close();
+    long long fr = 0, others;
+    gpu_info(&fr, &others);
+    printf("regrow: %zu MiB of VRAM taken back in %.1f s (%zu MiB of data moved back)%s%s%s; %lld MiB free now\n",
+           taken >> 20, (now_us() - t0) / 1e6, copied * (CHUNK >> 20), why ? " - stopped: " : "", why ? why : "",
+           closed ? "; all data in VRAM again, spill file deleted" : "", fr >> 20);
+}
+
+static void gpu_tick(void) {
+    long long fr, others;
+    if (gpu_info(&fr, &others))
+        return;
+    if (gpu_others0 < 0) {   // the first look: our start
+        gpu_others0 = others;
+        gpu_free0 = fr;
+    } else if (others < gpu_others0) {   // a program that ran at our start has ended
+        gpu_others0 = others;
+    }
+    double now = now_us();
+    int busy = gpu_busy(others);
+    if (busy)
+        gpu_quiet_since = 0;
+    else if (!gpu_quiet_since)
+        gpu_quiet_since = now;
+    if (now < gpu_retry)
+        return;
+    if (busy && fr < gpu_keep && __atomic_load_n(&slabs_held, __ATOMIC_RELAXED) && sb_state == SB_NONE) {
+        static int told;
+        if (!told++)
+            printf("yield: other programs need VRAM, but without a standby swap (STANDBY_MB=0) none can be given back\n");
+    } else if (busy && fr < gpu_keep && __atomic_load_n(&slabs_held, __ATOMIC_RELAXED)) {
+        gpu_yield(fr, others);
+    }
+    else if (!busy && !user_off && spill_fd >= 0 && now - gpu_quiet_since >= GPU_QUIET_S * 1e6)
+        gpu_regrow();
+}
+
+// ---- spill / fill on request ----
 static void spill(void) {
     double t0 = now_us();
-    if (!count_state(C_VRAM, 0) && !vram_held) {
+    user_off = 1;   // nothing is taken back by itself now (only by a fill)
+    if (!__atomic_load_n(&slabs_held, __ATOMIC_RELAXED)) {
         printf("spill: nothing in VRAM\n");
         return;
     }
@@ -1356,72 +1810,32 @@ static void spill(void) {
         printf("spill failed: no standby swap to take new pages meanwhile (see STANDBY_MB) - the data stays in VRAM\n");
         return;
     }
-    const char *how = "already open";
-    if (spill_fd < 0) {
-        if (!spill_path) {
-            printf("spill failed: no spill file set (USM_VRAMD_SPILL) - the data stays in VRAM\n");
-            return;
-        }
-        int fd = open(spill_path, O_RDWR | O_CREAT | O_EXCL | O_DIRECT | O_CLOEXEC, 0600);
-        if (fd < 0) {
-            printf("spill failed: %s: %s - the data stays in VRAM\n", spill_path, strerror(errno));
-            return;
-        }
-        // Reserve all the space now: no "disk full" later, and no block allocation while serving.
-        // Written zeros if the disk can do that without sending data: then later writes need no
-        // file system changes either (direct overwrites of allocated blocks).
-        how = "zeroed in advance";
-        if (fallocate(fd, FALLOC_FL_WRITE_ZEROES, 0, (off_t)vram_bytes)) {
-            how = "space reserved";
-            if (fallocate(fd, 0, 0, (off_t)vram_bytes)) {
-                // Not enough disk space for all of it: reserve room for the data there is now; space
-                // for swap space never used so far is then taken when it gets used.
-                how = "space reserved for the current data only (disk too full for all of it)";
-                int ok = !ftruncate(fd, 0) && !ftruncate(fd, (off_t)vram_bytes);   // drop a partial reservation
-                for (size_t c = 0; ok && c < nr_chunks; c++)
-                    if (written(c))
-                        ok = !fallocate(fd, 0, (off_t)c * CHUNK, CHUNK);
-                if (!ok) {
-                    printf("spill failed: %s: cannot reserve %zu MiB: %s - the data stays in VRAM\n", spill_path,
-                           count_state(C_VRAM, 1) * (CHUNK >> 20), strerror(errno));
-                    close(fd);
-                    unlink(spill_path);
-                    return;
-                }
-            }
-        }
-        spill_fd = fd;   // seen by the queues after the lock below, before any chunk moves there
-        standby_on("data moves to the spill file");   // stays on now that the file is open (the controller sees it)
-    }
-    printf("spill: copying %zu MiB from VRAM to %s (%s)\n", count_state(C_VRAM, 1) * (CHUNK >> 20), spill_path,
-           how);
-    size_t copied = 0, again = 0;
-    int failed = 0, busy = 0;
-    for (size_t c = 0; c < nr_chunks && !failed && !busy; c++) {
-        if (chunk_state[c] != C_VRAM)
-            continue;
-        if (interrupted(M_SPILL))
-            break;
-        if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))   // new pages keep coming meanwhile
-            gc();
-        int r = move_chunk(c, 1, &again);
-        failed = r == -1;
-        busy = r == -2;
-        copied += r > 0;
-    }
-    size_t left = count_state(C_VRAM, 1);
-    if (count_state(C_VRAM, 0)) {
-        printf("spill %s after %.1f s: %zu MiB still in VRAM, %zu MiB in %s - the device keeps working from both\n",
-               failed ? "failed (copy error)" : busy ? "stopped (busy chunk, standby swap full)" : "stopped",
-               (now_us() - t0) / 1e6, left * (CHUNK >> 20),
-               count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
+    const char *e = spill_open();
+    if (e) {
+        printf("spill failed: %s - the data stays in VRAM\n", e);
         return;
     }
-    pthread_rwlock_wrlock(&move_lock);   // nothing lives in VRAM any more: give it back
-    if (!fake_mem && vram_held)
-        cuMemFree(vram);
-    vram_held = 0;
-    pthread_rwlock_unlock(&move_lock);
+    standby_on("data moves to the spill file");   // stays on now that the file is open (the controller sees it)
+    if (spill_reserve(0, nr_chunks)) {
+        printf("spill failed: %s: cannot reserve %zu MiB: %s - the data stays in VRAM\n", spill_path,
+               count_state(C_VRAM, 1) * (CHUNK >> 20), strerror(errno));
+        spill_close();
+        return;
+    }
+    printf("spill: copying %zu MiB from VRAM to %s (%s)\n", count_state(C_VRAM, 1) * (CHUNK >> 20), spill_path,
+           spill_how[spill_mode]);
+    size_t copied = 0, again = 0;
+    int r = R_DONE;
+    for (size_t k = nr_slabs; k-- > 0 && r == R_DONE;)
+        if (slab_held[k])
+            r = slab_out(k, M_SPILL, &copied, &again);
+    if (__atomic_load_n(&slabs_held, __ATOMIC_RELAXED)) {
+        printf("spill %s after %.1f s: %zu MiB still in VRAM, %zu MiB in %s - the device keeps working from both\n",
+               r == R_FAILED ? "failed (copy error)" : r == R_BUSY ? "stopped (busy chunk, standby swap full)" : "stopped",
+               (now_us() - t0) / 1e6, count_state(C_VRAM, 1) * (CHUNK >> 20), count_state(C_FILE, 1) * (CHUNK >> 20),
+               spill_path);
+        return;
+    }
     printf("spilled: VRAM released - /dev/ublkb%u now keeps its data in %s (%zu MiB copied in %.1f s,"
            " %zu chunk copies repeated)\n",
            dev_id, spill_path, copied * (CHUNK >> 20), (now_us() - t0) / 1e6, again);
@@ -1429,46 +1843,45 @@ static void spill(void) {
 
 static void fill(void) {
     double t0 = now_us();
+    user_off = 0;
     if (!count_state(C_FILE, 0)) {
         printf("fill: nothing in the spill file\n");
         return;
     }
-    if (!vram_held) {
-        CUresult r = fake_mem ? 0 : cuMemAlloc(&vram, vram_bytes);
-        if (r) {
-            printf("fill failed: cannot get %zu MiB of VRAM (CUDA error %d) - the data stays in %s\n",
-                   vram_bytes >> 20, r, spill_path);
-            return;
-        }
-        vram_held = 1;
-    }
     standby_on("data moves back from the spill file");   // should be on already (since the spill)
     printf("fill: copying %zu MiB from %s back to VRAM\n", count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
-    size_t copied = 0, again = 0;
-    int failed = 0, busy = 0;
-    for (size_t c = 0; c < nr_chunks && !failed && !busy; c++) {
-        if (chunk_state[c] != C_FILE)
+    // While other programs use the GPU, they keep what would only be given back to them again.
+    long long fr, others, keep = gpu_keep && !gpu_info(&fr, &others) && gpu_busy(others) ? gpu_keep : -1;
+    size_t copied = 0, again = 0, got = 0;
+    int r = R_DONE, cuerr = 0;
+    for (size_t k = 0; k < nr_slabs && r == R_DONE; k++) {
+        if (slab_held[k] && !slab_count(k, C_FILE))
             continue;
-        if (interrupted(M_FILL))
-            break;
-        if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))
-            gc();
-        int r = move_chunk(c, 0, &again);
-        failed = r == -1;
-        busy = r == -2;
-        copied += r > 0;
+        int held = slab_held[k];
+        r = slab_in(k, M_FILL, keep, &copied, &again, &cuerr);
+        got += !held && slab_held[k];
     }
     if (count_state(C_FILE, 0)) {
-        printf("fill %s after %.1f s: %zu MiB still in %s - the device keeps working from both\n",
-               failed ? "failed (copy error)" : busy ? "stopped (busy chunk, standby swap full)" : "stopped",
-               (now_us() - t0) / 1e6, count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
+        char vr[160] = "";
+        if (cuerr)
+            snprintf(vr, sizeof vr, "cannot get VRAM (CUDA error %d)", cuerr);
+        else
+            snprintf(vr, sizeof vr, "other programs use the GPU (%lld MiB kept free for them)", gpu_keep >> 20);
+        const char *later = gpu_keep ? "; the rest comes back by itself once they are done" : "";
+        if (r == R_NO_VRAM && !got && !copied)
+            printf("fill failed: %s - the data stays in %s%s\n", vr, spill_path, later);
+        else if (r == R_NO_VRAM)
+            printf("fill stopped after %.1f s (no room in the VRAM: %s): %zu MiB still in %s - the device keeps"
+                   " working from both%s\n", (now_us() - t0) / 1e6, vr, count_state(C_FILE, 1) * (CHUNK >> 20),
+                   spill_path, later);
+        else
+            printf("fill %s after %.1f s: %zu MiB still in %s - the device keeps working from both\n",
+                   r == R_FAILED ? "failed (copy error)" : r == R_BUSY ? "stopped (busy chunk, standby swap full)"
+                                                         : "stopped",
+                   (now_us() - t0) / 1e6, count_state(C_FILE, 1) * (CHUNK >> 20), spill_path);
         return;
     }
-    pthread_rwlock_wrlock(&move_lock);   // nothing lives in the file any more
-    close(spill_fd);
-    spill_fd = -1;
-    pthread_rwlock_unlock(&move_lock);
-    unlink(spill_path);
+    spill_close();
     printf("filled: all data of /dev/ublkb%u is back in VRAM (%zu MiB copied in %.1f s, %zu chunk copies"
            " repeated); %s deleted\n",
            dev_id, copied * (CHUNK >> 20), (now_us() - t0) / 1e6, again, spill_path);
@@ -1479,6 +1892,8 @@ static void *mover_main(void *arg) {
     int ok = (fake_mem || (!cuCtxSetCurrent(ctx) && !cuStreamCreate(&move_stream, STREAM_NON_BLOCKING))) &&
              !stage_copy(0, 0) && !stage_copy(1, 0);   // warm-up, as for the queues
     prefault_stack();
+    if (ok && gpu_keep)
+        gpu_tick();   // what other programs use now: the baseline
     pthread_mutex_lock(&ready_lock);
     mover_state = ok ? 1 : -1;
     pthread_cond_broadcast(&ready_cond);
@@ -1487,10 +1902,19 @@ static void *mover_main(void *arg) {
         fprintf(stderr, "mover: setup failed\n");
         return NULL;
     }
+    double next_tick = 0;
     for (;;) {
         pthread_mutex_lock(&move_mx);
-        while (move_cmd == M_NONE && !gc_wanted)
-            pthread_cond_wait(&move_cv, &move_mx);
+        if (move_cmd == M_NONE && !gc_wanted) {
+            if (gpu_keep) {   // look at the GPU again in a moment
+                struct timespec t;
+                timeout_in(&t, GPU_TICK_MS);
+                pthread_cond_timedwait(&move_cv, &move_mx, &t);
+            } else {
+                while (move_cmd == M_NONE && !gc_wanted)
+                    pthread_cond_wait(&move_cv, &move_mx);
+            }
+        }
         int cmd = move_cmd;
         move_cmd = M_NONE;
         pthread_mutex_unlock(&move_mx);
@@ -1502,6 +1926,10 @@ static void *mover_main(void *arg) {
             fill();
         if (__atomic_load_n(&gc_wanted, __ATOMIC_RELAXED))
             gc();
+        if (gpu_keep && now_us() >= next_tick) {
+            next_tick = now_us() + GPU_TICK_MS * 1000.0 * 0.8;
+            gpu_tick();
+        }
     }
 }
 
@@ -1526,15 +1954,20 @@ static void write_stats(int fd, struct queue *queues) {
             on_disk++;
     }
     unsigned long long pages = st_zero + st_raw + st_comp;
-    char buf[512];
+    long long held = __atomic_load_n(&held_b, __ATOMIC_RELAXED), gfree = __atomic_load_n(&gpu_free_now, __ATOMIC_RELAXED);
+    long long gothers = __atomic_load_n(&gpu_others_now, __ATOMIC_RELAXED);
+    gothers = gfree < 0 || gpu_others0 < 0 ? -1 : gothers > gpu_others0 ? (gothers - gpu_others0) >> 20 : 0;
+    char buf[768];
     int n = snprintf(buf, sizeof buf,
                      "device_mb=%zu vram_mb=%zu vram_held=%d compress=%.2f in_vram_mb=%zu on_disk_mb=%zu live_mb=%llu"
                      " pages=%llu zero=%llu raw=%llu comp=%llu comp_pct=%.0f refused=%llu reads=%llu writes=%llu"
-                     " errors=%llu standby=%s standby_files=%d standby_room=%d\n",
-                     dev_bytes >> 20, vram_bytes >> 20, vram_held, cz_ratio, in_vram * (CHUNK >> 20),
+                     " errors=%llu standby=%s standby_files=%d standby_room=%d switched_off=%d given_back_mb=%lld"
+                     " gpu_keep_mb=%lld gpu_free_mb=%lld gpu_others_mb=%lld\n",
+                     dev_bytes >> 20, vram_bytes >> 20, held > 0, cz_ratio, in_vram * (CHUNK >> 20),
                      on_disk * (CHUNK >> 20), live >> 20, pages, st_zero, st_raw, st_comp,
                      st_comp ? 100.0 * st_comp_bytes / (st_comp * (double)PG) : 0.0, st_full, reads, writes, errors,
-                     sb_names[__atomic_load_n(&sb_state, __ATOMIC_RELAXED)], sb_n, __atomic_load_n(&sb_room_ok, __ATOMIC_RELAXED));
+                     sb_names[__atomic_load_n(&sb_state, __ATOMIC_RELAXED)], sb_n, __atomic_load_n(&sb_room_ok, __ATOMIC_RELAXED),
+                     user_off, ((long long)vram_bytes - held) >> 20, gpu_keep >> 20, gfree < 0 ? -1 : gfree >> 20, gothers);
     if (n > 0 && pwrite(fd, buf, (size_t)n, 0) == n && ftruncate(fd, n))
         n = 0;
 }
@@ -1547,7 +1980,8 @@ static void tell_mover(int cmd) {
 }
 
 // `usm-vramd probe`: can this machine run the tier? One line of key=value for `usm check` and the installer.
-// Touches nothing: no ublk device, no VRAM allocated (it only asks the driver how much is free).
+// Touches nothing: no ublk device, no VRAM allocated (it only asks the driver how much is free). While the tier
+// runs, not even a CUDA context: the daemon would take it for another program using the GPU and give VRAM back.
 static int probe(void) {
     printf("lz4=%s", dlopen("liblz4.so.1", RTLD_NOW) ? "yes" : "no");
     void *lib = dlopen("libcuda.so.1", RTLD_NOW);
@@ -1586,8 +2020,16 @@ static int probe(void) {
         if (*c == '"')
             *c = '\'';
     total(&tot, dev);
+    char st[1024];
+    struct stat sst;
+    const char *gf = NULL;   // the running daemon's last look at the GPU (its status line, rewritten every 5 s)
+    if (!stat("/run/usm-vramd.stats", &sst) && time(NULL) - sst.st_mtime < 15 &&
+        !read_proc("/run/usm-vramd.stats", st, sizeof st))
+        gf = strstr(st, " gpu_free_mb=");
     CUcontext c;
-    if (!retain(&c, dev)) {
+    if (gf && strtoll(gf + 13, NULL, 10) >= 0)
+        fr = (size_t)strtoll(gf + 13, NULL, 10) << 20;
+    else if (!retain(&c, dev)) {
         if (!set_current(c))
             mem_info(&fr, &tt);
         set_current(NULL);
@@ -1692,7 +2134,22 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    const char *gf = getenv("USM_VRAMD_GPU_FREE_MB");   // giving VRAM back to other programs
+    if (gf && *gf) {
+        char *end;
+        long long mb = strtoll(gf, &end, 10);
+        if (*end || mb < 0 || mb > (1ll << 24)) {
+            fprintf(stderr, "USM_VRAMD_GPU_FREE_MB: MiB to keep free for other programs (0 = never give VRAM back)\n");
+            return 2;
+        }
+        gpu_keep = mb << 20;
+    }
+    gpu_fake = getenv("USM_VRAMD_FAKE_GPU");
+    if (gpu_fake && !*gpu_fake)
+        gpu_fake = NULL;
     const char *fake = getenv("USM_VRAMD_FAKE");
+    if (fake && *fake && !gpu_fake)   // test mode without a fake GPU: no GPU to watch
+        gpu_keep = 0;
     if (fake && *fake) {   // test mode: map the device memory, no CUDA
         int fd = open(fake, O_RDWR);
         struct stat st;
@@ -1723,6 +2180,7 @@ int main(int argc, char **argv) {
     cuCtxSetCurrent = cuda_sym(lib, "cuCtxSetCurrent");
     cuMemAlloc = cuda_sym(lib, "cuMemAlloc_v2");
     cuMemFree = cuda_sym(lib, "cuMemFree_v2");
+    cuMemGetInfo = cuda_sym(lib, "cuMemGetInfo_v2");
     cuMemHostRegister = cuda_sym(lib, "cuMemHostRegister_v2");
     cuMemcpyHtoDAsync = cuda_sym(lib, "cuMemcpyHtoDAsync_v2");
     cuMemcpyDtoHAsync = cuda_sym(lib, "cuMemcpyDtoHAsync_v2");
@@ -1733,8 +2191,22 @@ int main(int argc, char **argv) {
     cuda_check(cuDeviceGet(&cudev, 0), "cuDeviceGet");
     cuda_check(cuDevicePrimaryCtxRetain(&ctx, cudev), "cuDevicePrimaryCtxRetain");
     cuda_check(cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
-    cuda_check(cuMemAlloc(&vram, vram_bytes), "cuMemAlloc (VRAM)");
 buffers:;
+    nr_slabs = (vram_bytes + SLAB - 1) / SLAB;
+    slab_ptr = calloc(nr_slabs, sizeof *slab_ptr);
+    slab_held = calloc(nr_slabs, 1);
+    slab_leaving = calloc(nr_slabs, 1);
+    if (!slab_ptr || !slab_held || !slab_leaving) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    for (size_t k = 0; k < nr_slabs; k++) {   // the VRAM, in pieces that can be given back one by one
+        if (!fake_mem)
+            cuda_check(cuMemAlloc(&slab_ptr[k], slab_len(k)), "cuMemAlloc (VRAM)");
+        slab_held[k] = 1;
+    }
+    slabs_held = nr_slabs;
+    held_b = (long long)vram_bytes;
     dev_bytes = cz_ratio ? (size_t)((double)vram_bytes * cz_ratio) & ~(size_t)(CHUNK - 1) : vram_bytes;
     // Per queue: I/O buffers; compressed mode also: read scratch, open segment, 2 pages for file reads.
     size_t io_part = (size_t)depth * IO_BUF;
@@ -1762,8 +2234,10 @@ buffers:;
         seg_live = calloc(nr_chunks, sizeof *seg_live);
         seg_open = calloc(nr_chunks, sizeof *seg_open);
         free_segs = calloc(nr_chunks, sizeof *free_segs);
+        ffree_segs = calloc(nr_chunks, sizeof *ffree_segs);
+        seg_tmp = calloc(nr_chunks, sizeof *seg_tmp);
         gdst.moves = calloc(CHUNK / 16, sizeof(struct gc_move));
-        if (pmap == MAP_FAILED || !seg_live || !seg_open || !free_segs || !gdst.moves) {
+        if (pmap == MAP_FAILED || !seg_live || !seg_open || !free_segs || !ffree_segs || !seg_tmp || !gdst.moves) {
             fprintf(stderr, "out of memory (page map)\n");
             return 1;
         }
@@ -1906,10 +2380,13 @@ buffers:;
         char czs[96] = "";
         if (cz_ratio)
             snprintf(czs, sizeof czs, ", compressed (lz4) into %zu MiB", vram_bytes >> 20);
+        char gys[96] = "never";
+        if (gpu_keep)
+            snprintf(gys, sizeof gys, "once other programs use the GPU, until %lld MiB are free", gpu_keep >> 20);
         printf("ready: /dev/ublkb%u = %zu MiB of %s%s (%d queues x depth %d, poll %d us; spill file: %s;"
-               " standby swap: %s)\n", dev_id, dev_bytes >> 20,
+               " standby swap: %s; VRAM given back: %s)\n", dev_id, dev_bytes >> 20,
                fake_mem ? "TEST device memory (RTX 3050 copy times)" : "VRAM", czs, nr_queues, depth, poll_us,
-               spill_path ? spill_path : "none", sb_state != SB_NONE ? sb_paths[0] : "none");
+               spill_path ? spill_path : "none", sb_state != SB_NONE ? sb_paths[0] : "none", gys);
         const char *sp = getenv("USM_VRAMD_STATS");   // a one-line status file, rewritten every 5 s
         int stats_fd = sp && *sp ? open(sp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644) : -1;
         for (;;) {

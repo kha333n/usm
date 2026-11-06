@@ -22,7 +22,7 @@ links only against libc (glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+, Fedora 
 distribution.
 
 ```bash
-VERSION=0.1.0-beta.2
+VERSION=0.1.0-beta.3
 curl -LO https://github.com/kha333n/usm/releases/download/v$VERSION/usm-$VERSION-linux-x86_64.tar.gz
 curl -LO https://github.com/kha333n/usm/releases/download/v$VERSION/usm-$VERSION-linux-x86_64.tar.gz.sha256
 sha256sum -c usm-$VERSION-linux-x86_64.tar.gz.sha256
@@ -57,7 +57,7 @@ docker or podman (`DOCKER=podman`). The result goes to `dist/`.
 
 1. Set the new version in `VERSION` and add its section to `CHANGELOG.md`, then commit and push.
 2. Either create a release on GitHub (*Releases → Draft a new release*, new tag = `v` + the version, e.g.
-   `v0.1.0-beta.2`, then publish), or push the tag: `git tag v0.1.0-beta.2 && git push origin v0.1.0-beta.2`.
+   `v0.1.0-beta.3`, then publish), or push the tag: `git tag v0.1.0-beta.3 && git push origin v0.1.0-beta.3`.
 3. The *Release* workflow builds the tarball in Ubuntu 22.04, runs the checks and attaches the `.tar.gz` and
    `.sha256` to the release, after a minute or two. It creates the release if there is none (a pre-release for
    alpha / beta / rc) and fills in an empty title and notes from `CHANGELOG.md`.

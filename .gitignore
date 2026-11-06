@@ -12,6 +12,7 @@
 /third_party/liburing/src/*.os
 /third_party/liburing/src/*.d
 /tests/desktop/hog
+/tests/gpu/gpu-claim
 __pycache__/
 *.pyc
 # editors

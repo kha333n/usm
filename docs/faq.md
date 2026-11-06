@@ -43,7 +43,14 @@ report what you find.
 
 ### Will it hurt my games, AI or video work?
 
-**Only while it's on**, because it holds the VRAM. Before GPU-heavy work:
+**It steps aside by itself.** CUDA doesn't share VRAM between programs: while USM holds it, another program's
+allocations simply fail. So once another program starts using the GPU, USM gives its VRAM back in 64 MiB pieces
+until 1 GiB is free (`GPU_FREE_MB`), and more while that program keeps growing. Empty pieces go at once. Pieces with
+data first copy it to the disk (`SPILL_DIR`), while swapping keeps working. Once the program has been done for 30
+seconds, USM takes the VRAM back.
+
+There is no warning before an allocation. So a program that grabs a lot of VRAM in one go right as it starts (e.g.
+llama.cpp, Ollama, some games) may still find too little free. For those, switch the tier off first:
 
 ```bash
 usm off     # the VRAM is free again in seconds
@@ -51,7 +58,7 @@ usm off     # the VRAM is free again in seconds
 usm on
 ```
 
-The **Quick Settings toggle** does the same with one click. Automatic switching is on the [roadmap](#roadmap).
+The **Quick Settings toggle** does the same with one click.
 
 ### What happens if I switch it off while RAM is full?
 
@@ -173,7 +180,6 @@ The tier is switched off first, your zswap and readahead settings are restored, 
 
 ## Roadmap
 
-- [ ] Switch the tier off automatically when a game or other GPU app starts
 - [ ] AMD and Intel GPUs (Vulkan backend)
 - [ ] The guard on KDE Plasma (KWin script)
 - [ ] `.deb` / `.rpm` packages, then a PPA / COPR

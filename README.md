@@ -58,8 +58,8 @@ USM puts it to work:
 - **More room, much faster swap.** When RAM fills up, Linux swaps the coldest pages into the GPU's memory instead
   of the SSD. A page comes back in ~9 µs, about 7× faster than NVMe swap, and GPU memory never stalls the way a busy
   SSD does. lz4 compression fits ~3× more, so a 6 GB card holds ~16 GB.
-- **Easy to give back.** When you need the GPU, `usm off` returns the VRAM in seconds. There's a switch on the
-  desktop too.
+- **It steps aside.** When another program needs the GPU's memory, USM gives it back by itself, piece by piece, and
+  takes it again once that program is done. `usm off` frees all of it in seconds; there's a switch on the desktop too.
 - **A guard.** It watches for real memory stalls and briefly pauses a busy background app, so the app you're using
   and the desktop stay responsive. Nothing gets killed.
 
@@ -104,8 +104,8 @@ are all welcome, and we'll keep widening support over time too. See [Docs](#docs
 
 ```bash
 # prebuilt release (https://github.com/kha333n/usm/releases):
-curl -LO https://github.com/kha333n/usm/releases/download/v0.1.0-beta.2/usm-0.1.0-beta.2-linux-x86_64.tar.gz
-tar xzf usm-0.1.0-beta.2-linux-x86_64.tar.gz && cd usm-0.1.0-beta.2-linux-x86_64
+curl -LO https://github.com/kha333n/usm/releases/download/v0.1.0-beta.3/usm-0.1.0-beta.3-linux-x86_64.tar.gz
+tar xzf usm-0.1.0-beta.3-linux-x86_64.tar.gz && cd usm-0.1.0-beta.3-linux-x86_64
 sudo ./install.sh
 
 # or from source:
@@ -121,7 +121,7 @@ also run unattended (`--yes --tier on --guard on`). Downloads, building, all opt
 
 ```bash
 usm status                  # everything at a glance
-usm on  /  usm off          # the VRAM tier: off before games / AI, on again after
+usm on  /  usm off          # the VRAM tier (it gives VRAM back to other GPU programs by itself)
 usm guard on / off          # the guard
 usm config show             # settings; change with: sudo usm config set KEY=VALUE
 usm report                  # what happened in the last 24 h

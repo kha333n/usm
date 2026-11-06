@@ -115,8 +115,8 @@ PARTS = {
 SETTINGS = [
     S("VRAM_MB", "auto", integer(256, 1 << 20, "auto"), "tier",
       "How much GPU memory to use as swap, in MiB. auto = all of it but 1 GiB; if this GPU also drives a "
-      "screen, all but 2 GiB or 30% (whichever is more); never more than is free when the tier starts. Before "
-      "games, AI or other GPU-heavy apps: usm off (usm on afterwards)."),
+      "screen, all but 2 GiB or 30% (whichever is more); never more than is free when the tier starts. When "
+      "other programs need the GPU's memory, the tier gives it back by itself (see GPU_FREE_MB)."),
     S("COMPRESS", "3", integer(0, 8), "tier",
       "0 = store pages as they are. 2..8 = compress them (lz4, on the CPU, ~1 us per page): the swap device is "
       "COMPRESS x VRAM_MB big. Typical app memory shrinks to about a third, so 3 fills the VRAM well. When the "
@@ -132,6 +132,12 @@ SETTINGS = [
       "disk is short of space. When it fills up while needed, more files of this size are added (as long as the "
       "disk keeps 10% free, at least 2 GiB); they go again when it switches off. 0 = none: then a full VRAM "
       "refuses writes (Linux keeps those pages in RAM) and switching off needs room in RAM."),
+    S("GPU_FREE_MB", "1024", integer(0, 1 << 20, "off"), "tier",
+      "VRAM kept free for other programs (games, AI, video, 3D) once they start using the GPU: the tier gives "
+      "its VRAM back to them in 64 MiB pieces until this much is free - empty pieces at once, the others after "
+      "their data moved to SPILL_DIR (needs the standby swap) - and takes it back once they have been done for "
+      "30 s. off = never give VRAM back. A program that takes a lot of VRAM in one go right as it starts (e.g. "
+      "llama.cpp, Ollama, some games) may still find too little free: usm off before it, or raise this."),
     S("ZSWAP_POOL_WITH_TIER", "10", integer(0, 100, "keep"), "tier",
       "zswap (compressed swap cache in RAM) while the tier is on: a pool of this % of RAM; restored when the "
       "tier goes off. 0 = zswap off while on. keep = do not touch zswap. 10 keeps a small fast cache in RAM and "

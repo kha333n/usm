@@ -102,6 +102,8 @@ def swap_label(name):
         return "VRAM tier"
     if name.startswith("/dev/zram"):
         return "zram"
+    if "/usm-swap/standby" in name:
+        return "VRAM tier standby"
     if "/usm-swap/" in name:
         return "guard temp file"
     return name

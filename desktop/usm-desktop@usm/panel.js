@@ -88,6 +88,7 @@ class UsmToggle extends QuickMenuToggle {
         super({title: 'VRAM swap', subtitle: '', iconName: ICON, toggleMode: false});
         this._refresh = refresh;
         this._busy = null;
+        this._syncing = false;
         this.menu.setHeader(ICON, 'USM', 'GPU memory as swap · memory guard');
 
         this._lines = [];
@@ -98,10 +99,11 @@ class UsmToggle extends QuickMenuToggle {
         }
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._tierSwitch = new PopupMenu.PopupSwitchMenuItem('VRAM swap tier', false);
-        this._tierSwitch.connect('toggled', (_i, on) => this._switch(on ? 'tier-on' : 'tier-off'));
+        // GNOME 48+ emits "toggled" for setToggleState() too: only a click may switch anything (see update()).
+        this._tierSwitch.connect('toggled', (_i, on) => this._syncing || this._switch(on ? 'tier-on' : 'tier-off'));
         this.menu.addMenuItem(this._tierSwitch);
         this._guardSwitch = new PopupMenu.PopupSwitchMenuItem('Memory guard', false);
-        this._guardSwitch.connect('toggled', (_i, on) => this._switch(on ? 'guard-on' : 'guard-off'));
+        this._guardSwitch.connect('toggled', (_i, on) => this._syncing || this._switch(on ? 'guard-on' : 'guard-off'));
         this.menu.addMenuItem(this._guardSwitch);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addAction('It felt slow just now (mark it)', () => this._mark());
@@ -123,8 +125,13 @@ class UsmToggle extends QuickMenuToggle {
             this.subtitle = 'VRAM released';
         else
             this.subtitle = 'Off';
-        this._tierSwitch.setToggleState(s.tier !== 'off');
-        this._guardSwitch.setToggleState(s.guard !== 'off');
+        this._syncing = true;   // showing the state is not a request to change it
+        try {
+            this._tierSwitch.setToggleState(s.tier !== 'off');
+            this._guardSwitch.setToggleState(s.guard !== 'off');
+        } finally {
+            this._syncing = false;
+        }
 
         // One line per tier, in the order memory goes: RAM -> zswap -> VRAM -> swap file; then the guard.
         const lines = [`RAM: ${gib(s.mem.MemAvailable || 0)} of ${gib(s.mem.MemTotal || 0)} GiB free`];

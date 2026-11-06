@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.0-beta.3] - 2026-11-06
+
+The VRAM tier now steps aside by itself when other programs need the GPU. Tested on an RTX 3050 6 GB laptop GPU: a
+CUDA program asking for 4.5 GB got all of it while the tier held 800 MB of an app's swapped data, which moved to the
+disk and back with no errors.
+
+- **New: VRAM goes back to other programs by itself** (`GPU_FREE_MB`, default 1024). CUDA doesn't share VRAM, so
+  while the tier held it, a game or AI app that needed GPU memory simply got "out of memory". Now the daemon borrows
+  its VRAM in 64 MiB pieces and watches the GPU's free memory. Once another program starts using the GPU, pieces go
+  back until `GPU_FREE_MB` is free (empty ones at once, the others after their data moved to the spill file, as in a
+  spill), and they are taken back once that program has been done for 30 s. `usm off` stays off until `usm on`.
+  `GPU_FREE_MB=off` keeps the old behaviour. Known limit: a program that takes a lot of VRAM in one go right as it
+  starts may still find too little free (see the FAQ).
+- `usm status` shows how much VRAM is given back, and names the standby swap files correctly (they showed as guard
+  temp files).
+- `usm check` and the installer no longer open a CUDA context while the tier runs (the daemon would have taken it for
+  another program and given VRAM back).
+- **Fixed: the Quick Settings menu could switch the guard or the VRAM tier off by itself** on newer GNOME (seen on
+  GNOME 50), where showing a switch's new state counts as a click. The guard restarting during an upgrade, or the
+  tier coming back on after a wake, could so turn it off for good. Only real clicks switch anything now.
+
 ## [0.1.0-beta.2] - 2026-11-05
 
 Fixes a hang. Please update if you run 0.1.0-beta.1.

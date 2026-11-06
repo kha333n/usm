@@ -5,6 +5,7 @@
 #   make dist         release tarball in dist/ (with the daemon built here; packaging/build-release.sh
 #                     builds it in an Ubuntu 22.04 container instead, so it runs on older systems too)
 #   make tests/desktop/hog   test helper for tests/desktop (see tests/README.md)
+#   make tests/gpu/gpu-claim a CUDA program that needs VRAM (tests the tier giving VRAM back)
 #   make clean
 VERSION := $(shell cat VERSION)
 CC ?= cc
@@ -29,11 +30,14 @@ check: $(DAEMON)
 tests/desktop/hog: tests/desktop/hog.c
 	$(CC) $(CFLAGS) -Wall -o $@ $<
 
+tests/gpu/gpu-claim: tests/gpu/gpu-claim.c
+	$(CC) $(CFLAGS) -Wall -o $@ $< -ldl
+
 dist: $(DAEMON)
 	packaging/make-tarball.sh
 
 clean:
-	rm -f $(DAEMON) tests/desktop/hog
+	rm -f $(DAEMON) tests/desktop/hog tests/gpu/gpu-claim
 	-$(MAKE) -C $(URING)/src clean > /dev/null 2>&1
 	rm -f $(URING)/config-host.h $(URING)/config-host.mak $(URING)/config.log \
 		$(URING)/src/include/liburing/compat.h $(URING)/src/include/liburing/io_uring_version.h

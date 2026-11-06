@@ -76,6 +76,23 @@ in RAM. And switching off with RAM full is refused too.
 After a spill, a background job (`usm-vramd-drain`) moves the pages into RAM once RAM has room, then stops the
 daemon. `usm on` during that time copies the data back into VRAM (**fill**).
 
+### Giving VRAM back to other programs (`GPU_FREE_MB`)
+
+CUDA doesn't share VRAM between programs: once USM holds it, another program's allocations fail (out of memory).
+So the daemon borrows its VRAM in 64 MiB pieces and watches the GPU's free memory 20 times a second. What other
+programs use is the GPU's total, minus what is free, minus USM's share.
+- **Another program starts using the GPU** (it uses 64 MiB more than when the tier started): the daemon gives pieces
+  back until `GPU_FREE_MB` (1 GiB by default) is free, and more while that program keeps growing. It picks the pieces
+  with the least data first. Empty ones go at once. Ones with data are copied to the spill file first, as in a spill
+  (with the standby swap on), and the device keeps serving the whole time.
+- **The program is done** (its use back down for 30 s): the daemon takes the pieces back, as long as what was free
+  when the tier started stays free, and copies their data back into VRAM.
+
+`usm off` stays off: after a spill, nothing is taken back until `usm on`. Without a standby swap (`STANDBY_MB=0`) no
+VRAM can be given back. There is no warning before an allocation, so a program that takes a lot of VRAM in one go
+right as it starts may still find too little free. Switch the tier off before those, or raise `GPU_FREE_MB`.
+`GPU_FREE_MB=off` never gives VRAM back.
+
 ### Sleep and hibernation
 
 Before suspend or hibernate, Linux freezes all programs, `usm-vramd` too. A page still in VRAM could then not be read,
