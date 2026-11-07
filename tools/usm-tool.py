@@ -2,7 +2,7 @@
 """usm-tool: the read-only parts of the `usm` command (no root needed).
 
   status            everything at a glance
-  dash              live view, refreshed every second (q or Ctrl+C to quit)
+  dash [MINUTES]    live view, refreshed every second, with charts of the last MINUTES (5; q to quit)
   report [SINCE]    what happened: SINCE = hours (24, the default), a day (2026-11-05) or 'all'
   mark [NOTE]       note that the PC felt slow or hung just now - goes into the logs for tuning
   log [N]           the last N (30) events
@@ -11,37 +11,16 @@ Settings: usm config (usm_config.py); machine check: usm check (usm_check.py).
 import csv
 import glob
 import gzip
-import io
-import json
 import os
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from usm_log import app_name, desktop_user, read_desktop  # noqa: E402
+from usm_dash import LOG_DIR, conf, events, guard_state, log_files, open_text, swap_label, tail_events  # noqa: E402
+from usm_log import desktop_user, read_desktop  # noqa: E402
 
 LIB = os.path.dirname(os.path.realpath(__file__))
-CONF = "/etc/usm/usm.conf"
-GUARD_STATE = "/run/usm-guard.state"
-
-
-def conf():
-    out = {}
-    try:
-        for line in open(CONF):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                out[k.strip()] = v.strip()
-    except OSError:
-        pass
-    return out
-
-
-LOG_DIR = conf().get("LOG_DIR", "/var/log/usm")
-
-
 def read(path, default=""):
     try:
         with open(path) as f:
@@ -85,28 +64,8 @@ def psi_avg(path):
     return out
 
 
-def guard_state():
-    try:
-        st = json.loads(read(GUARD_STATE) or "{}")
-    except ValueError:
-        return {}
-    return st if st and time.time() - st.get("t", 0) < 10 else {}
-
-
 def gib(mb):
     return f"{mb / 1024:.1f}"
-
-
-def swap_label(name):
-    if name.startswith("/dev/ublkb"):
-        return "VRAM tier"
-    if name.startswith("/dev/zram"):
-        return "zram"
-    if "/usm-swap/standby" in name:
-        return "VRAM tier standby"
-    if "/usm-swap/" in name:
-        return "guard temp file"
-    return name
 
 
 # ---------------------------------------------------------------------------------- status
@@ -156,107 +115,16 @@ def status():
     dk = read_desktop(u[0]) if u else {}
     lag = f"; desktop lag (last 2 s) {dk.get('lag_max_ms', '?')} ms" if dk else ""
     print(f"Stalls:     waiting for memory (last 10 s): some {p.get('some', 0):.1f}%, all {p.get('full', 0):.1f}%{lag}")
-    print("More:       usm dash (live) | usm report (what happened) | usm mark (it felt slow just now)")
+    print("More:       usm app or usm dash (live) | usm report (what happened) | usm mark (it felt slow just now)")
 
 
 # ---------------------------------------------------------------------------------- dash
-def bar(frac, width=30):
-    frac = max(0.0, min(1.0, frac))
-    n = int(round(frac * width))
-    return "[" + "#" * n + "." * (width - n) + "]"
-
-
-def dash():
-    import select
-    import termios
-    import tty
-    prev, prev_t = {}, time.monotonic()
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd) if os.isatty(fd) else None
-    try:
-        if old:
-            tty.setcbreak(fd)
-        while True:
-            vs = {k: int(v) for k, v in (line.split() for line in read("/proc/vmstat").splitlines())}
-            now = time.monotonic()
-            dt = max(now - prev_t, 1e-3)
-            rate = lambda k: (vs.get(k, 0) - prev.get(k, vs.get(k, 0))) / dt
-            out = [f"USM   {time.strftime('%H:%M:%S')}   (q to quit)", "=" * 100]
-            mi = meminfo()
-            used = mi["MemTotal"] - mi["MemAvailable"]
-            out.append(f"RAM    {bar(used / mi['MemTotal'], 40)} {gib(used)} of {gib(mi['MemTotal'])} GiB in use"
-                       + (f"   zswap {gib(mi['Zswapped'])} GiB in {gib(mi['Zswap'])} GiB" if mi.get("Zswap") else ""))
-            for name, size, usedk, prio in swaps():
-                out.append(f"SWAP   {bar(usedk / max(size, 1), 40)} {gib(usedk)} of {gib(size)} GiB  {swap_label(name)}")
-            st = dict(kv.split("=") for kv in read("/run/usm-vramd.stats").split() if "=" in kv)
-            if st:
-                held = "VRAM held" if st.get("vram_held") == "1" else "VRAM RELEASED (data on disk)"
-                out.append(f"TIER   {held}: {st.get('in_vram_mb')} MiB of segments in VRAM, {st.get('on_disk_mb')} MiB on disk,"
-                           f" {st.get('live_mb')} MiB of data, compressed to {st.get('comp_pct')}%"
-                           + (f", {st['refused']} writes REFUSED" if st.get("refused", "0") != "0" else ""))
-            p = psi_avg("/proc/pressure/memory")
-            out.append(f"PAGING swap-in {rate('pswpin') * 4 / 1024:7.1f} MiB/s  swap-out {rate('pswpout') * 4 / 1024:7.1f} MiB/s"
-                       f"  major faults {rate('pgmajfault'):7.0f}/s")
-            out.append(f"STALLS waiting for memory: some {p.get('some', 0):5.1f}%  all {p.get('full', 0):5.1f}%  (10 s)"
-                       f" {bar(p.get('some', 0) / 100, 20)}")
-            u = desktop_user()
-            dk = read_desktop(u[0]) if u else {}
-            gs = guard_state()
-            if dk:
-                out.append(f"DESK   in front: {dk.get('focus_app', '?')}   desktop lag {dk.get('lag_max_ms', '?')} ms"
-                           f"   idle {int(dk.get('idle_ms') or 0) // 1000} s")
-            out.append(f"GUARD  {gs.get('mode', 'not running')}" + (f"   PAUSED: {', '.join(gs['frozen_apps'])}"
-                                                                    if gs.get("frozen_apps") else ""))
-            out.append("")
-            if u:
-                rows = []
-                for c in glob.glob(f"{u[1]}/app.slice/*.scope"):
-                    cur = int(read(f"{c}/memory.current", "0") or 0) >> 20
-                    sw = int(read(f"{c}/memory.swap.current", "0") or 0) >> 20
-                    fr = read(f"{c}/cgroup.freeze").strip() == "1"
-                    rows.append((cur + sw, cur, sw, fr, app_name(os.path.basename(c))))
-                rows.sort(reverse=True)
-                out.append(f"{'APP':34s} {'RAM MiB':>8s} {'SWAP MiB':>9s}")
-                for tot, cur, sw, fr, name in rows[:12]:
-                    out.append(f"{name[:34]:34s} {cur:8d} {sw:9d}  {'PAUSED' if fr else ''}")
-            ev = tail_events(6)
-            if ev:
-                out += ["", "EVENTS"] + [f"  {e[:120]}" for e in ev]
-            prev, prev_t = vs, now
-            sys.stdout.write("\033[H\033[2J" + "\n".join(out) + "\n")
-            sys.stdout.flush()
-            if old:
-                r, _, _ = select.select([sys.stdin], [], [], 1.0)
-                if r and sys.stdin.read(1) in ("q", "Q"):
-                    break
-            else:
-                time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if old:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+def dash(minutes=5):
+    import usm_dash
+    usm_dash.run(minutes, version=read(os.path.join(LIB, "VERSION"), "?").strip())
 
 
 # ---------------------------------------------------------------------------------- logs
-def log_files(name, t0, t1):
-    """Daily files of `name` that can hold [t0, t1], oldest first."""
-    out = []
-    for p in glob.glob(f"{LOG_DIR}/{name}-*"):
-        day = os.path.basename(p)[len(name) + 1:len(name) + 11]
-        try:
-            d0 = time.mktime(time.strptime(day, "%Y-%m-%d"))
-        except ValueError:
-            continue
-        if d0 + 86400 >= t0 and d0 <= t1:
-            out.append((day, p))
-    return [p for _, p in sorted(out)]
-
-
-def open_text(p):
-    return io.TextIOWrapper(gzip.open(p), errors="replace") if p.endswith(".gz") else open(p, errors="replace")
-
-
 def rows(name, t0, t1):
     for p in log_files(name, t0, t1):
         try:
@@ -270,27 +138,6 @@ def rows(name, t0, t1):
                         yield t, r
         except (OSError, EOFError, gzip.BadGzipFile):
             continue
-
-
-def events(t0, t1):
-    out = []
-    for p in log_files("events", t0, t1):
-        try:
-            with open_text(p) as f:
-                for line in f:
-                    try:
-                        t = time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
-                    except ValueError:
-                        continue
-                    if t0 <= t <= t1:
-                        out.append((t, line.rstrip("\n")))
-        except (OSError, EOFError, gzip.BadGzipFile):
-            continue
-    return out
-
-
-def tail_events(n):
-    return [line for _, line in events(time.time() - 2 * 86400, time.time())[-n:]]
 
 
 def num(r, k):
@@ -472,7 +319,14 @@ def main():
     if cmd == "status":
         status()
     elif cmd == "dash":
-        dash()
+        try:
+            minutes = float(args[0]) if args else 5
+        except ValueError:
+            minutes = 0
+        if not 1 <= minutes <= 60:
+            print("usm dash [MINUTES]: charts of the last 1 to 60 minutes (default 5)")
+            sys.exit(2)
+        dash(minutes)
     elif cmd == "report":
         report(args[0] if args else "24")
     elif cmd == "mark":

@@ -162,6 +162,40 @@ Finished days are gzipped. Logs are kept for 30 days, at most 300 MiB (`LOG_*` s
 sysfs, cgroups, NVML) and writes from a background thread at idle I/O priority, so a busy disk never stalls the
 sampling. `usm report` and `usm dash` read these files.
 
+## The live view (`usm dash`)
+
+`usm dash [MINUTES]` refreshes every second (q quits; c, a and e hide or show the charts, apps and events):
+- **every swap** with its requests per second and their **latency**, from zswap in RAM to the VRAM tier and the
+  disk. Latency is the average time a read or write took, from the kernel's block counters (`/sys/block/*/stat`),
+  which is what a program waits for a page coming back from swap. For a swap file it is the disk's latency, so it
+  covers all of that disk's I/O. The counters count whole milliseconds, and the VRAM tier answers in tens of
+  microseconds: with only a few requests, the dash looks back up to 15 s for enough of them and marks the figure
+  `~` (rough), or shows an upper bound (`<`).
+- **charts of the last MINUTES (5)**: swap-in and swap-out (zswap included), read latency of each swap device, RAM
+  in use and the time apps waited for memory. They start with the logger's samples, so they are full at once.
+- the tier, the guard, the app in front and the desktop's lag, the apps using the most memory and the latest events.
+
+Charts sit side by side from 150 columns; on a small terminal, they get lower and the least useful ones go first.
+
+## The app (`usm app`)
+
+The same data in a window (`desktop/app/usm-app.py`, GTK 4 + libadwaita, Python): open "USM" from the app grid, the
+Quick Settings menu's "Live view", or run `usm app`.
+- **Right now**: RAM in use, how memory is doing ("All smooth", "Swapping smoothly", "Memory is tight"), and the
+  switches for the VRAM tier and the guard. They run `usm-helper` through pkexec, like the GNOME menu.
+- **Memory tiers**: RAM → zswap → VRAM tier → disk swap, how full each is, the read latency of the VRAM tier and the
+  disk, and the traffic between them, in MiB/s. The VRAM tier's device carries only swap; disk swap is the rest of
+  the swap I/O.
+- **Over time** (1, 5 or 15 minutes, or an hour): swap latency of each device on a log scale, swap traffic per tier
+  (out up, back down), RAM in use and the time apps waited for memory. Point at a chart for the values at that
+  moment. Like `usm dash`, the charts start with the logger's samples.
+- **Apps and events**: the apps using the most RAM and swap (paused ones marked), and the logger's latest events.
+
+It only reads, like `usm dash`, and needs no root. It draws with the CPU and never opens the GPU: a GPU context on the
+NVIDIA card would count as another program using the GPU, and the tier would give VRAM back every time the window
+opened (`USM_APP_GPU=1` lets GTK use the GPU). On the test laptop it takes about 100 MiB of RAM and a few percent of
+one core; the dots that show traffic between the tiers move only while the window is in front.
+
 ## Files
 
 | Path | What |
@@ -173,5 +207,6 @@ sampling. `usm report` and `usm dash` read these files.
 | `/var/log/usm/` | logs |
 | `/var/lib/usm-swap/` | standby swap file, spill file (only while needed) |
 | `/usr/local/share/gnome-shell/extensions/usm-desktop@usm/` | GNOME extension |
+| `/usr/local/share/applications/com.kha333n.USM.desktop` | the app's launcher (its icon: `/usr/local/share/icons/hicolor/scalable/apps/`) |
 | `/usr/share/polkit-1/actions/org.usm.switch.policy` | lets the desktop menu switch USM without a password |
 | `/run/usm-*` | runtime state (gone at reboot) |

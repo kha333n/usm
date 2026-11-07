@@ -99,6 +99,7 @@ sudo ./install.sh --yes --set GUARD_PAUSE_MAX_S=10 --set LOG_MAX_MB=100
 | `--set KEY=VALUE` | Any setting, repeatable: see [configuration.md](configuration.md) |
 | `--no-logger` | Don't switch the logger on |
 | `--no-desktop` | Don't install the GNOME extension |
+| `--no-app` | Don't install the USM app (installed by default on desktops with GTK 4.14+ and libadwaita for Python; `usm check` says if this one has them) |
 | `--build` | Compile the daemon even if a prebuilt one is there |
 | `--test-no-gpu` | Allow installing without an NVIDIA GPU (test VMs, with `TEST_DEVICE_MEMORY`) |
 
@@ -126,6 +127,7 @@ effect after `usm off && usm on`, or a reboot. All settings: [configuration.md](
 | logs | `/var/log/usm/` (30 days, at most 300 MiB) |
 | standby swap file, spill file | `/var/lib/usm-swap/` |
 | GNOME extension | `/usr/local/share/gnome-shell/extensions/usm-desktop@usm/` |
+| the app (launcher, icon) | `/usr/local/share/applications/com.kha333n.USM.desktop`, `/usr/local/share/icons/hicolor/scalable/apps/com.kha333n.USM.svg` |
 | polkit rule (desktop switches without a password) | `/usr/share/polkit-1/actions/org.usm.switch.policy` |
 
 USM doesn't change your fstab, kernel command line, sysctl files or swap files. zswap and swap readahead are only

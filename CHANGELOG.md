@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+- **New: the USM app** (`usm app`, or "USM" in the app grid). The live view in a window: RAM, every memory tier
+  (RAM, zswap, the VRAM tier, disk swap) with its latency and traffic, charts of the last 1, 5 or 15 minutes or an
+  hour (swap latency, swap traffic per tier, RAM, waiting for memory) with values on hover, the apps using the most
+  memory, the latest events, and the VRAM tier and guard switches. Optional: installed where GTK 4.14+ and
+  libadwaita are there for Python (Ubuntu 24.04+); `--no-app` skips it, `usm check` says if it can run. It draws
+  with the CPU, so opening it never makes the VRAM tier give memory back. The Quick Settings menu's "Live view" opens
+  it.
+- **`usm dash` shows every swap's latency and charts.** Each swap (zswap, the VRAM tier, disk swap) with its reads
+  and writes per second and how long they take on average, and charts of the last 5 minutes (`usm dash 15` for 15):
+  swap-in, swap-out, the read latency of each swap device, RAM in use and the time apps waited for memory. The charts
+  start with the logger's samples, so they are full at once. Swap-in and swap-out now count pages that zswap keeps
+  in RAM too (they only counted the disk and the VRAM tier).
+
 ## [0.1.0-beta.3] - 2026-11-06
 
 The VRAM tier now steps aside by itself when other programs need the GPU. Tested on an RTX 3050 6 GB laptop GPU: a

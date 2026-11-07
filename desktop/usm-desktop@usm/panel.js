@@ -107,7 +107,7 @@ class UsmToggle extends QuickMenuToggle {
         this.menu.addMenuItem(this._guardSwitch);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addAction('It felt slow just now (mark it)', () => this._mark());
-        this.menu.addAction('Live view', () => this._terminal([USM, 'dash']));
+        this.menu.addAction('Live view', () => this._liveView());
         this.menu.addAction('Report: last 24 hours', () => this._terminal(['sh', '-c',
             `${USM} report; echo; read -p "Press Enter to close " x`]));
 
@@ -184,6 +184,17 @@ class UsmToggle extends QuickMenuToggle {
         Main.panel.closeQuickSettings();
         run([USM, 'mark', 'marked from the desktop menu'], (ok, out) =>
             Main.notify('USM', ok ? 'Marked: it felt slow just now. Shows in "usm report".' : out));
+    }
+
+    _liveView() {
+        // the USM app when it is installed, else usm dash in a terminal
+        const app = Shell.AppSystem.get_default().lookup_app('com.kha333n.USM.desktop');
+        if (app) {
+            Main.panel.closeQuickSettings();
+            app.activate();
+        } else {
+            this._terminal([USM, 'dash']);
+        }
     }
 
     _terminal(argv) {

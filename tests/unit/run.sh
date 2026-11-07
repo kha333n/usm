@@ -17,7 +17,7 @@ if command -v shellcheck > /dev/null; then
 fi
 
 echo "python (compile)"
-for f in tools/*.py guard/*.py vram/*.py tests/desktop/*.py tests/spill/*.py; do
+for f in tools/*.py guard/*.py vram/*.py desktop/app/*.py tests/desktop/*.py tests/spill/*.py; do
   python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" && ok "$f" || bad "$f"
 done
 
@@ -51,6 +51,45 @@ python3 tools/usm_config.py doc | diff -q - docs/configuration.md > /dev/null &&
 
 echo "machine check (tools/usm_check.py --shell)"
 out=$(python3 tools/usm_check.py --shell) && echo "$out" | grep -q '^CORE_OK=' && ok "runs" || bad "usm_check --shell"
+
+echo "live view (tools/usm_dash.py)"
+out=$(COLUMNS=100 LINES=60 timeout 30 python3 tools/usm-tool.py dash 1 < /dev/null 2>&1) &&
+  grep -q '^SWAP ' <<< "$out" && grep -q 'now$' <<< "$out" && ok "one picture (piped)" || bad "usm dash: ${out:0:400}"
+python3 - <<'PY' && ok "latency: exact, rough (~), upper bound (<), looking back" || bad "latency rules"
+import sys
+sys.path.insert(0, "tools")
+import usm_dash as d
+s = d.Sampler(300)
+def rec(t, rio, rms):
+    return {"t": t, "dev": {"x": (rio, rms, 0, 0)}}
+s.hist.extend([rec(1000, 1000, 20)])
+assert s.latency("x") == (20.0, ""), s.latency("x")
+s.hist.clear(); s.hist.extend([rec(1000, 100, 2)])
+assert s.latency("x") == (20.0, "~"), s.latency("x")
+s.hist.clear(); s.hist.extend([rec(1000, 4, 0)])
+assert s.latency("x") == (250.0, "<"), s.latency("x")
+s.hist.clear(); s.hist.extend(rec(1000 + i, 100, 1) for i in range(30))
+assert s.latency("x") == (10.0, ""), s.latency("x")          # 10 s back: 1000 reads, 10 ms
+s.hist.clear(); s.hist.extend(rec(1000 + i, 1, 0) for i in range(30))
+assert s.latency("x") == (1000 / 16, "<"), s.latency("x")    # 15 s back at most
+s.hist.clear(); s.hist.extend([rec(1000, 0, 0)])
+assert s.latency("x") == (None, ""), s.latency("x")
+assert d.chart_rows([0, 0.01, 2.5, 10, None, d.FEW], 2, 10, d.Style(False, True)) == [" " * 3 + "█" + " " * 2, " ▁▄█ ·"]
+PY
+
+echo "app (desktop/app)"
+if command -v desktop-file-validate > /dev/null; then
+  desktop-file-validate desktop/app/com.kha333n.USM.desktop && ok "desktop file" || bad "desktop file"
+fi
+if command -v xvfb-run > /dev/null && command -v dbus-run-session > /dev/null && python3 -c 'import gi
+gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_version("Gsk", "4.0")' 2> /dev/null; then
+  out=$(env -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS GDK_BACKEND=x11 GDK_DEBUG=no-portals NO_AT_BRIDGE=1 timeout 90 \
+    dbus-run-session -- xvfb-run -a -s "-screen 0 1400x1100x24" python3 desktop/app/usm-app.py --screenshot "$T/app.png" \
+    --size 1300x1000 --wait 2.5 2>&1)
+  if [ -s "$T/app.png" ] && ! grep -q Traceback <<< "$out"; then ok "renders (Xvfb), no Python errors"; else bad "app: ${out: -600}"; fi
+else
+  printf '  skip  %s\n' "app render test (needs xvfb-run, dbus-run-session and GTK 4 + libadwaita for Python)"
+fi
 
 echo "installer"
 ./install.sh --help > /dev/null && ok "install.sh --help" || bad "install.sh --help"

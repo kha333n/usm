@@ -119,8 +119,12 @@ also run unattended (`--yes --tier on --guard on`). Downloads, building, all opt
 
 ## Use
 
+![The USM app: RAM, every swap tier with its live latency, and charts of the last minutes](docs/images/usm-app.png)
+
 ```bash
+usm app                     # the app (above): live charts, every swap's latency, the tier and guard switches
 usm status                  # everything at a glance
+usm dash                    # the live view in a terminal
 usm on  /  usm off          # the VRAM tier (it gives VRAM back to other GPU programs by itself)
 usm guard on / off          # the guard
 usm config show             # settings; change with: sudo usm config set KEY=VALUE
@@ -130,7 +134,8 @@ sudo usm uninstall
 ```
 
 The GNOME Quick Settings menu has a "VRAM swap" toggle with memory, VRAM and swap usage, the guard and its paused
-apps.
+apps; its "Live view" opens the app. The app is optional: the installer adds it where GTK 4.14+ and libadwaita are
+there for Python (Ubuntu 24.04 and newer have them).
 
 ## How well it works
 

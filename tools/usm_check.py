@@ -80,6 +80,21 @@ def probe():
     return vals
 
 
+def app_versions():
+    """(GTK minor, libadwaita minor) if the USM app's libraries are there for Python, else None. In a child process:
+    nothing here may open a display."""
+    code = ("import ctypes, gi\n"
+            "gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1'); gi.require_version('Gsk', '4.0')\n"
+            "print(ctypes.CDLL('libgtk-4.so.1').gtk_get_minor_version(), "
+            "ctypes.CDLL('libadwaita-1.so.0').adw_get_minor_version())")
+    rc, out = run(sys.executable, "-c", code)
+    try:
+        g, a = (int(x) for x in out.split())
+        return (g, a) if rc == 0 else None
+    except ValueError:
+        return None
+
+
 def checks():
     """[(group, status, name, detail)], plus a summary dict."""
     res, s = [], {}
@@ -172,6 +187,18 @@ def checks():
         add("Guard", OK if pk else WARN, "polkit (pkexec)", "" if pk else "missing: the desktop menu cannot switch "
             "USM on/off (use the usm command)")
     s["DESKTOP"] = int(bool(g) or bool(glob.glob("/usr/share/xsessions/*")) or bool(glob.glob("/usr/share/wayland-sessions/*")))
+
+    # --- the app (optional): a window with the live view and the switches ---
+    v = app_versions() if s["DESKTOP"] else None
+    s["APP_OK"] = int(bool(v) and v[0] >= 14)
+    if s["DESKTOP"]:
+        if s["APP_OK"]:
+            add("App", OK, "USM app", f"GTK 4.{v[0]}, libadwaita 1.{v[1]}: open \"USM\" from the app grid, or usm app")
+        elif v:
+            add("App", INFO, "USM app", f"needs GTK 4.14 or newer (this is 4.{v[0]}); usm dash shows the same")
+        else:
+            add("App", INFO, "USM app", "needs GTK 4 and libadwaita for Python (sudo apt install python3-gi "
+                "gir1.2-adw-1); usm dash shows the same in a terminal")
     return res, s
 
 
@@ -197,6 +224,8 @@ def main():
     guard = "full (pauses busy background apps under overload)" if gv and 45 <= int(gv) <= 50 else \
         "watch only (logs what it would do)"
     print(f"  guard:                    {guard if s['CORE_OK'] else 'not available'}")
+    if s["DESKTOP"]:
+        print(f"  app:                      {'works (usm app)' if s['APP_OK'] else 'not available - see App above'}")
     return 0 if s["CORE_OK"] else 1
 
 

@@ -8,7 +8,8 @@
 #
 # What goes where: programs /usr/local/lib/usm, command /usr/local/sbin/usm, settings /etc/usm/usm.conf,
 # services /etc/systemd/system/usm-*.service, logs /var/log/usm, GNOME extension
-# /usr/local/share/gnome-shell/extensions/usm-desktop@usm, polkit rule /usr/share/polkit-1/actions/org.usm.switch.policy.
+# /usr/local/share/gnome-shell/extensions/usm-desktop@usm, polkit rule /usr/share/polkit-1/actions/org.usm.switch.policy,
+# the app (if GTK 4 is there) /usr/local/share/applications/com.kha333n.USM.desktop + its icon.
 # Undo: sudo usm uninstall [--purge]   (or ./uninstall.sh)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -19,6 +20,9 @@ CONF=/etc/usm/usm.conf
 EXT=usm-desktop@usm
 EXT_DIR=/usr/local/share/gnome-shell/extensions/$EXT
 POLKIT=/usr/share/polkit-1/actions
+APP_ID=com.kha333n.USM
+APPS=/usr/local/share/applications
+ICONS=/usr/local/share/icons/hicolor
 
 usage() {
   cat <<EOF
@@ -40,6 +44,8 @@ usage: sudo ./install.sh [OPTIONS]
                          usm config show --all
   --no-logger            do not switch the logger on (usm report then has no data)
   --no-desktop           do not install the GNOME extension (Quick Settings menu + the guard's focus info)
+  --no-app               do not install the USM app (a window with live charts and the switches; installed on
+                         desktops that have GTK 4.14+ and libadwaita for Python, as Ubuntu 24.04+ has)
   --build                compile the daemon even if a prebuilt one is there
   --test-no-gpu          allow installing without an NVIDIA GPU (test VMs; see TEST_DEVICE_MEMORY)
   -h, --help
@@ -50,7 +56,7 @@ EOF
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
-YES=0 PROFILE=auto TIER=keep GUARD=keep LOGGER=on DESKTOP_EXT=yes BUILD=0 TEST=0
+YES=0 PROFILE=auto TIER=keep GUARD=keep LOGGER=on DESKTOP_EXT=yes APP=yes BUILD=0 TEST=0
 SETS=()
 while [ $# -gt 0 ]; do
   case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -67,6 +73,7 @@ while [ $# -gt 0 ]; do
     --set) [ $# -ge 2 ] || die "--set KEY=VALUE"; SETS+=("$2"); shift ;;
     --no-logger) LOGGER=off ;;
     --no-desktop) DESKTOP_EXT=no ;;
+    --no-app) APP=no ;;
     --build) BUILD=1 ;;
     --test-no-gpu) TEST=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -199,7 +206,7 @@ install -m 755 "$ROOT/vram/usm-vramd" "$ROOT/vram/usm-vramd-ctl" "$ROOT/vram/usm
   "$ROOT/guard/usm-guard.py" "$ROOT/guard/usm-guard-service" \
   "$ROOT/tools/usm-logger.py" "$ROOT/tools/usm-tool.py" "$ROOT/tools/usm_config.py" "$ROOT/tools/usm_check.py" \
   "$ROOT/tools/usm-helper" "$ROOT/uninstall.sh" $LIB/
-install -m 644 "$ROOT/tools/usm_log.py" "$ROOT/VERSION" "$ROOT/README.md" "$ROOT/LICENSE" $LIB/
+install -m 644 "$ROOT/tools/usm_log.py" "$ROOT/tools/usm_dash.py" "$ROOT/VERSION" "$ROOT/README.md" "$ROOT/LICENSE" $LIB/
 install -d $LIB/docs && install -m 644 "$ROOT"/docs/*.md $LIB/docs/
 install -m 755 "$ROOT/tools/usm" "$CMD"
 for u in usm-vram usm-guard usm-logger; do
@@ -248,6 +255,22 @@ if [ "$PROFILE" = desktop ] && [ "$DESKTOP_EXT" = yes ]; then
     fi
   elif [ "$GNOME_OK" = 1 ]; then
     say "GNOME extension installed; enable it as the desktop user: gnome-extensions enable $EXT (then log out and in)"
+  fi
+fi
+
+# ---- the USM app (desktop, optional): GTK 4.14+ (paths for its charts) and libadwaita for Python ----
+if [ "$PROFILE" = desktop ] && [ "$APP" = yes ]; then
+  if [ "${APP_OK:-0}" = 1 ]; then
+    install -m 755 "$ROOT/desktop/app/usm-app.py" $LIB/
+    install -m 644 "$ROOT/desktop/app/usm-app.css" $LIB/
+    install -D -m 644 "$ROOT/desktop/app/$APP_ID.desktop" $APPS/$APP_ID.desktop
+    install -D -m 644 "$ROOT/desktop/app/$APP_ID.svg" $ICONS/scalable/apps/$APP_ID.svg
+    [ -e $ICONS/icon-theme.cache ] && command -v gtk-update-icon-cache > /dev/null && gtk-update-icon-cache -q -t -f $ICONS
+    command -v update-desktop-database > /dev/null && update-desktop-database -q $APPS 2> /dev/null
+    say "USM app installed: open \"USM\" from the app grid, or run: usm app"
+  else
+    rm -f $LIB/usm-app.py $LIB/usm-app.css $APPS/$APP_ID.desktop $ICONS/scalable/apps/$APP_ID.svg
+    say "USM app not installed: it needs GTK 4.14+ and libadwaita for Python (sudo apt install python3-gi gir1.2-adw-1)"
   fi
 fi
 

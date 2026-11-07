@@ -3,7 +3,8 @@
 #   usm on | off              the VRAM swap tier (GPU memory as fast swap): now and at every boot
 #   usm guard on | off        the guard (keeps the desktop responsive under memory overload): now and at boot
 #   usm status                everything at a glance
-#   usm dash                  live view (q to quit)
+#   usm dash [MINUTES]        live view with charts of the last MINUTES (default 5; q to quit)
+#   usm app                   the USM app: the live view in a window, with the tier and guard switches
 #   usm report [HOURS|DAY|all]   what happened (default: the last 24 hours)
 #   usm mark [NOTE]           note that the PC felt slow or hung just now (shows in the report)
 #   usm log [N]               the last N events
@@ -35,6 +36,12 @@ guard)
   esac ;;
 status|dash|report|mark|log)
   exec /usr/bin/python3 "$LIB/usm-tool.py" "$@" ;;
+app)
+  [ "$(id -u)" != 0 ] || { echo "usm app: run it as your desktop user, without sudo (it needs no root)"; exit 1; }
+  [ -f "$LIB/usm-app.py" ] || { echo "usm app: not installed - it needs GTK 4.14+ and libadwaita for Python" \
+    "(sudo apt install python3-gi gir1.2-adw-1, then run the installer again)"; exit 1; }
+  shift
+  exec /usr/bin/python3 "$LIB/usm-app.py" "$@" ;;
 config)
   shift
   case "${1:-show}" in

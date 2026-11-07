@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=USM
+GenericName=Memory Monitor
+Comment=RAM, swap and the VRAM swap tier, live; switch the tier and the guard
+Exec=/usr/bin/python3 /usr/local/lib/usm/usm-app.py
+Icon=com.kha333n.USM
+Terminal=false
+Categories=System;Monitor;
+Keywords=memory;ram;swap;vram;gpu;zswap;usm;
+StartupNotify=true
+SingleMainWindow=true

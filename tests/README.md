@@ -3,7 +3,7 @@
 | What | How | Needs |
 |---|---|---|
 | Benchmark with vs without USM on this machine (contained, ~10 min) | `sudo tests/bench/usm-bench.sh [--quick] [--out FILE.md]` | USM installed, a C compiler; see [docs/benchmarks.md](../docs/benchmarks.md) |
-| Offline checks (syntax, settings tool, daemon `--version` / `probe`, docs up to date) | `make check` | nothing (CI runs this) |
+| Offline checks (syntax, settings tool, daemon `--version` / `probe`, docs up to date, `usm dash` and its latency rules, the app's launcher; the app drawn under Xvfb where GTK 4 is there) | `make check` | nothing (CI runs this) |
 | Guard rules, deterministic (fake clock and pressure, real pause/resume of tiny test apps) | `sudo tests/desktop/guard-policy-test.py UID` | USM installed, guard **stopped** (`usm guard off`), a logged-in desktop user UID |
 | Guard on the real desktop (memory hogs: in front / busy / recent / idle) | `make tests/desktop/hog` then `sudo tests/desktop/guard-desktop-test.py UID` | as above; uses a lot of RAM for a minute |
 | Pressure / working-set runs | `tests/desktop/pressure-test.sh`, `tests/desktop/touch-test.sh` | as above |

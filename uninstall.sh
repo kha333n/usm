@@ -28,6 +28,8 @@ systemctl disable -q usm-vram.service 2>/dev/null
 rm -f /etc/systemd/system/usm-vram.service /etc/systemd/system/usm-guard.service /etc/systemd/system/usm-logger.service
 rm -f /usr/local/sbin/usm /run/usm-guard.state /run/usm-guard.pause
 rm -rf $LIB /usr/local/share/gnome-shell/extensions/$EXT
+rm -f /usr/local/share/applications/com.kha333n.USM.desktop /usr/local/share/icons/hicolor/scalable/apps/com.kha333n.USM.svg
+command -v update-desktop-database > /dev/null && update-desktop-database -q /usr/local/share/applications 2> /dev/null
 rm -f /usr/share/polkit-1/actions/org.usm.switch.policy
 # The GNOME helper: take it out of the desktop user's enabled list.
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then

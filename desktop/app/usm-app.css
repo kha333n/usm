@@ -1,0 +1,111 @@
+/* USM app: deep navy surfaces, USM's lime (VRAM tier) and cyan as accents, as on usm.kha333n.com.
+   Tier colours: RAM blue, zswap cyan, VRAM tier lime, disk coral. */
+@define-color usm_bg #0a0e15;
+@define-color usm_text #e6edf3;
+@define-color usm_lime #a3ff12;
+@define-color usm_green #76b900;
+@define-color usm_cyan #22d3ee;
+@define-color usm_blue #60a5fa;
+@define-color usm_amber #f5a524;
+@define-color usm_coral #ff6b7a;
+@define-color accent_bg_color #5c9a00;
+@define-color accent_color #a3ff12;
+@define-color accent_fg_color #ffffff;
+
+window.usm {
+  background-color: @usm_bg;
+  background-image: radial-gradient(circle farthest-side at 100% 0%, alpha(@usm_lime, 0.08), transparent);
+  color: @usm_text;
+}
+window.usm headerbar { background: transparent; box-shadow: none; border: none; }
+window.usm scrolledwindow, window.usm viewport { background: transparent; }
+
+/* brand */
+.brand-name { font-size: 17px; font-weight: 800; letter-spacing: -0.3px; }
+.brand-version { font-size: 10.5px; font-weight: 700; color: @usm_amber; border: 1px solid alpha(@usm_amber, 0.45);
+  border-radius: 999px; padding: 1px 8px; }
+
+/* time range switch in the header */
+.range { background-color: alpha(white, 0.05); border-radius: 999px; padding: 3px; }
+.range button { background-image: none; border-radius: 999px; min-height: 24px; min-width: 34px; padding: 0 10px; font-weight: 700;
+  font-size: 12px; background: none; box-shadow: none; color: alpha(@usm_text, 0.6); }
+.range button:hover { color: @usm_text; background-color: alpha(white, 0.04); }
+.range button:checked { background-color: alpha(@usm_lime, 0.15); color: @usm_lime; }
+
+.live { font-size: 11px; font-weight: 800; letter-spacing: 1.2px; color: @usm_lime; }
+.live-dot { min-width: 8px; min-height: 8px; border-radius: 99px; background-color: @usm_lime;
+  box-shadow: 0 0 8px alpha(@usm_lime, 0.8); }
+.live-dot.dim { opacity: 0.35; box-shadow: none; }
+.live.stale, .live-dot.stale { color: @usm_amber; background-color: @usm_amber; box-shadow: none; }
+
+/* cards */
+.usm-card { background-color: alpha(white, 0.035); border: 1px solid alpha(white, 0.075); border-radius: 18px;
+  padding: 18px 20px; }
+.usm-card.hero { padding: 22px 26px; border-color: alpha(@usm_lime, 0.20);
+  background-image: linear-gradient(120deg, alpha(@usm_lime, 0.07), alpha(@usm_cyan, 0.035) 40%, transparent 75%); }
+.card-title { font-size: 14.5px; font-weight: 800; }
+.section-title { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; }
+.section-index { font-size: 11px; font-weight: 700; color: @usm_lime; border: 1px solid alpha(@usm_lime, 0.35);
+  border-radius: 7px; padding: 1px 6px; }
+
+/* text */
+.caption { font-size: 10.5px; font-weight: 800; letter-spacing: 1.1px; color: alpha(@usm_text, 0.48); }
+.headline { font-size: 27px; font-weight: 800; letter-spacing: -0.6px; }
+.subline { font-size: 14px; color: alpha(@usm_text, 0.72); }
+.big { font-size: 25px; font-weight: 800; letter-spacing: -0.5px; font-feature-settings: "tnum"; }
+.small { font-size: 12.5px; }
+.tiny { font-size: 11.5px; }
+.num { font-feature-settings: "tnum"; }
+.mono { font-family: "JetBrains Mono", "Ubuntu Sans Mono", "DejaVu Sans Mono", monospace; }
+.muted { color: alpha(@usm_text, 0.55); }
+.faint { color: alpha(@usm_text, 0.38); }
+.lime { color: @usm_lime; }
+.cyan { color: @usm_cyan; }
+.blue { color: @usm_blue; }
+.amber { color: @usm_amber; }
+.coral { color: @usm_coral; }
+
+/* pills and chips */
+.pill { font-size: 10px; font-weight: 800; letter-spacing: 0.9px; border-radius: 999px; padding: 2px 9px; }
+.pill.on { color: @usm_lime; background-color: alpha(@usm_lime, 0.13); }
+.pill.warn { color: @usm_amber; background-color: alpha(@usm_amber, 0.15); }
+.pill.off { color: alpha(@usm_text, 0.6); background-color: alpha(white, 0.08); }
+.pill.bad { color: @usm_coral; background-color: alpha(@usm_coral, 0.15); }
+.chip { border-radius: 999px; padding: 5px 12px; background-color: alpha(white, 0.045);
+  border: 1px solid alpha(white, 0.07); font-size: 12.5px; }
+.chip .k { color: alpha(@usm_text, 0.55); }
+
+/* the switches in the hero */
+.control { padding: 12px 14px; border-radius: 14px; background-color: alpha(white, 0.045);
+  border: 1px solid alpha(white, 0.06); }
+.control-title { font-weight: 800; font-size: 14px; }
+switch { background-color: alpha(white, 0.16); background-image: none; border: none; }
+switch:checked { background-color: #5c9a00; background-image: none; }
+switch:checked:hover { background-color: #66aa00; }
+switch > slider { background-color: #f3f6f9; border: none; box-shadow: 0 1px 3px alpha(black, 0.35); }
+
+/* memory tiers */
+.tier { border-radius: 16px; padding: 14px 16px; background-color: alpha(white, 0.03);
+  border: 1px solid alpha(white, 0.07); }
+.tier.ram { border-color: alpha(@usm_blue, 0.30); }
+.tier.zswap { border-color: alpha(@usm_cyan, 0.30); }
+.tier.vram { border-color: alpha(@usm_lime, 0.45); box-shadow: 0 0 32px alpha(@usm_lime, 0.08);
+  background-image: linear-gradient(160deg, alpha(@usm_lime, 0.09), transparent 65%); }
+.tier.disk { border-color: alpha(@usm_coral, 0.28); }
+.tier.dim { opacity: 0.5; }
+.tier.vram .big { color: @usm_lime; }
+.tier-name { font-weight: 800; font-size: 13.5px; }
+
+/* lists */
+.app-name { font-weight: 700; font-size: 13px; }
+.event-time { font-size: 11.5px; color: alpha(@usm_text, 0.45); }
+.event-text { font-size: 12.5px; }
+.empty { font-size: 13px; color: alpha(@usm_text, 0.45); }
+
+flowbox.plain > flowboxchild { padding: 0; background: none; box-shadow: none; outline: none; }
+flowbox.plain > flowboxchild:hover, flowbox.plain > flowboxchild:selected { background: none; }
+
+.footer { font-size: 12px; color: alpha(@usm_text, 0.42); }
+.footer link { color: alpha(@usm_cyan, 0.8); }
+
+.report { font-family: "JetBrains Mono", "Ubuntu Sans Mono", "DejaVu Sans Mono", monospace; font-size: 12.5px; }
